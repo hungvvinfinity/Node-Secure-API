@@ -1,0 +1,67 @@
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+      network: ${DOCKER_BUILD_NETWORK:-default}
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+      REDIS_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "loadtest:"
+      ANDROID_ENABLED: "true"
+      EXPECTED_PACKAGE_NAME: com.example.benchmark
+      EXPECTED_SIGNER_DIGESTS: abababababababababababababababababababababababababababababababab
+      MINIMUM_ANDROID_VERSION: "1"
+      IOS_ENABLED: "false"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    init: true
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-load-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+  seed:
+    build:
+      context: .
+      target: test
+      network: ${DOCKER_BUILD_NETWORK:-default}
+    user: "0:0"
+    environment:
+      REDIS_TEST_URL: redis://redis:6379
+      REDIS_KEY_PREFIX: "loadtest:"
+      LOAD_DEVICES: "512"
+    volumes:
+      - ${BENCHMARK_OUTPUT_DIR:?Use npm run benchmark:capacity}/fixtures:/fixtures
+    command: ["node", "--import", "tsx", "scripts/seed-load.ts"]
+    depends_on:
+      redis:
+        condition: service_healthy
+  k6:
+    image: grafana/k6:2.3.0@sha256:2dd4756ec6e14e62778916e1eb850108e4b499304c02df56760fa0bdb0fba0b8
+    user: "0:0"
+    environment:
+      BASE_URL: http://api:3000
+    volumes:
+      - ./scripts/load:/scripts:ro
+      - ${BENCHMARK_OUTPUT_DIR:?Use npm run benchmark:capacity}/fixtures:/fixtures:ro
+      - ${BENCHMARK_OUTPUT_DIR:?Use npm run benchmark:capacity}/results:/results
+    command: ["run", "/scripts/k6.js"]
+    depends_on:
+      api:
+        condition: service_healthy
+volumes:
+  redis-load-data:

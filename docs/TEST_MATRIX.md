@@ -5,7 +5,7 @@
 **Execution Environment**: Host Node.js v24.21.0, Redis Container `node-secure-api-continuation-20261029` (Redis server v8.10.3, Port 32773 / 32768); Docker Compose acceptance verified on Node.js v24.22.1 (`node:24-alpine`) and Redis 8-alpine  
 **Test Runner**: Node.js Native Test Runner (`tsx --test test/*.test.ts`)  
 **Suite Status**: **212 / 212 PASSED (100%)** — 45 Suites, 16 Test Files, 0 Failed, 0 Skipped (Docker Compose acceptance & container restart verification PASSED)  
-**Loaded `src/` Code Coverage**: 90.17% Lines, 75.93% Branches, 93.33% Functions (Runtime and server composition verified in separate Docker integration smoke)
+**Loaded `src/` Code Coverage**: 90.20% Lines, 75.93% Branches, 93.33% Functions (Runtime and server composition verified in separate Docker integration smoke)
 
 ---
 
@@ -387,7 +387,7 @@
 - **Assertion Signing Composite**: `crypto.sign('sha256', concat(authData, SHA256(canonicalRequest)), privateKey)`. Negative double-hash strictly rejected.
 - **Flags**: Registration flags enforce AT (`0x40`) and ED (`0x80` if extensions present). Assertion flags `0x00` accepted (no UP requirement).
 - **Monotonic signCount**: Tested strictly 0 -> 1 -> 2. Counter rollback and counter replay strictly rejected under both in-memory and Redis Lua storage.
-- **Strict Identity Enforcement**: In [src/platform/ios.ts](file:///home/hungvu/Documents/Node-Secure-API/src/platform/ios.ts), `verifyRequest` requires strict equality of stored `metadata.appId` and `metadata.environment`. Omitting either identity field fails closed with 403 `APP_ID_MISMATCH` or 403 `ENVIRONMENT_MISMATCH`.
+- **Strict Identity Enforcement**: In [src/platform/ios.ts](../src/platform/ios.ts), `verifyRequest` requires strict equality of stored `metadata.appId` and `metadata.environment`. Omitting either identity field fails closed with 403 `APP_ID_MISMATCH` or 403 `ENVIRONMENT_MISMATCH`.
 
 ### 3.3 Storage & Persistence Integrity
 - **Durable Raw Receipt Storage**: Raw CMS fraud receipt is durably persisted in the top-level hash field `'receipt'` in Redis HSET, while hot-path `getDevice` and memory caches intentionally omit `'receipt'` from HMGET fields to optimize RAM and latency.

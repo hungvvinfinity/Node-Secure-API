@@ -1,5 +1,7 @@
 # Đường request và phép đo local
 
+Phép đo capacity mới bằng k6 trên runtime Docker, gồm sweep quá tải và xác nhận 60s cho 1/4 process, ở [CAPACITY.md](CAPACITY.md). Bảng dưới là micro/local benchmark trước đó với sender Node cùng process; không so trực tiếp latency/RPS giữa hai phương pháp.
+
 Đã đo ngày 2026-10-28 UTC với Node v24.21.0, Redis thật trong container test, **AOF + appendfsync always**, HTTP loopback, 16 thiết bị tổng hợp, mỗi thiết bị gửi tuần tự. 1.024 request mỗi chế độ sau warm-up. Tất cả request phải trả 200, không tính request bị từ chối thành throughput thành công.
 
 | Chế độ | Request/giây | p50 ms | p95 ms | Redis đọc record | Atomic commit |

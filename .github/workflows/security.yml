@@ -16,6 +16,11 @@ jobs:
         with:
           node-version: '24'
       - run: npm run test:docker
+      - run: npm ci
+      - run: npm run stack:demo
+      - run: npm run test:stack
+      - run: npm run stack:demo:down
+        if: always()
   source-drift:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest

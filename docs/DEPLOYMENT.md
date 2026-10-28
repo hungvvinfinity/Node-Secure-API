@@ -17,7 +17,16 @@ REDIS_TEST_URL=redis://127.0.0.1:6379 npm test
 REDIS_TEST_URL=redis://127.0.0.1:6379 npm run test:ci
 ```
 
-`compose.yaml` chỉ cấp Redis local bind loopback, durable volume, AOF và noeviction. Không chạy `docker compose down -v` với dữ liệu cần giữ. Runtime production dùng Redis được quản lý nội bộ, ACL, TLS và backup; không công khai cổng Redis ra Internet.
+`compose.yaml` chạy toàn bộ gateway: service `api` build target runtime và service `redis` có durable volume, AOF/noeviction. API dùng Redis DNS nội bộ, chờ Redis healthy trước startup và có readiness healthcheck riêng. API bind host loopback cổng `API_PORT` (mặc định 3000); Redis bind loopback cổng `REDIS_BIND_PORT` (mặc định 6379). Không chạy `docker compose down -v` với dữ liệu cần giữ. Redis production cần ACL/TLS/backup và mạng nội bộ; không công khai cổng Redis ra Internet.
+
+```bash
+# Có .env với app identity thật:
+docker compose up --build -d --wait
+# Chưa có app identity, chỉ smoke startup bằng identity ví dụ:
+docker compose -f compose.yaml -f compose.demo.yaml up --build -d --wait
+```
+
+Demo vẫn xác minh official Google/Apple trust và Google CRL; nó không chấp nhận CA tổng hợp từ client. Chạy `npm run test:stack` sau khi stack demo healthy để kiểm tra runtime qua cổng API thật. Máy hiện tại đã chạy với `DOCKER_BUILDKIT=0 DOCKER_BUILD_NETWORK=host REDIS_BIND_PORT=0 npm run stack:demo`; Redis host port ngẫu nhiên tránh xung đột. `npm run stack:demo:down` dừng stack mà giữ volume.
 
 ## Chạy gateway
 

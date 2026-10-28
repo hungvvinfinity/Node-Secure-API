@@ -13,11 +13,17 @@
     "test:coverage": "tsx --test --experimental-test-coverage --test-coverage-include='src/**/*.ts' test/*.test.ts",
     "test:ci": "node scripts/require-test-redis.mjs && npm run test:coverage",
     "test:docker": "node scripts/test-compose.mjs",
+    "test:stack": "tsx scripts/verify-stack.ts",
     "canary:preflight": "node scripts/canary-preflight.mjs",
+    "stack:up": "docker compose up --build -d --wait --wait-timeout 90",
+    "stack:demo": "docker compose -f compose.yaml -f compose.demo.yaml up --build -d --wait --wait-timeout 90",
+    "stack:down": "docker compose down",
+    "stack:demo:down": "docker compose -f compose.yaml -f compose.demo.yaml down",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "security:sources": "node scripts/check-upstream.mjs",
     "benchmark": "tsx scripts/benchmark.ts",
+    "benchmark:capacity": "node scripts/run-capacity.mjs",
     "test:redis-restart": "tsx scripts/verify-redis-restart.ts"
   },
   "dependencies": {

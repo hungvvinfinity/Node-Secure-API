@@ -1,0 +1,14 @@
+# Explicit local startup/demo identities. No production trust or signature bypass.
+name: node-secure-api-demo
+services:
+  api:
+    environment:
+      NODE_ENV: production
+      REDIS_KEY_PREFIX: "demo-secure-api:"
+      ANDROID_ENABLED: "true"
+      EXPECTED_PACKAGE_NAME: com.example.secure
+      EXPECTED_SIGNER_DIGESTS: abababababababababababababababababababababababababababababababab
+      MINIMUM_ANDROID_VERSION: "1"
+      IOS_ENABLED: "true"
+      IOS_APP_ID: TEAMID1234.com.example.secure
+      IOS_APP_ATTEST_ENV: production

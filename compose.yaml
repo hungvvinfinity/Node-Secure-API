@@ -1,9 +1,44 @@
 services:
+  api:
+    image: node-secure-api:${IMAGE_TAG:-local}
+    build:
+      context: .
+      target: runtime
+      network: ${DOCKER_BUILD_NETWORK:-default}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+      NODE_ENV: ${NODE_ENV:-production}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "127.0.0.1:${API_PORT:-3000}:3000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "--input-type=module", "-e", "const r = await fetch('http://127.0.0.1:3000/ready', {signal: AbortSignal.timeout(2000)}); if (r.status !== 200 || (await r.json()).status !== 'READY') process.exit(1)"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 12
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 15s
+    restart: unless-stopped
   redis:
     image: redis:8-alpine
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:${REDIS_BIND_PORT:-6379}:6379"
     volumes:
       - redis-data:/data
     healthcheck:

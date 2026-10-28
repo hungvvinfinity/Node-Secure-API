@@ -1,0 +1,72 @@
+{
+  "generatedAt": "2026-10-28T22:22:44.331Z",
+  "scope": "synthetic-seeded Android steady-state on actual runtime API",
+  "hardwareAttestationMeasured": false,
+  "tlsOrAiBusinessMeasured": false,
+  "slo": {
+    "p95Ms": 100,
+    "p99Ms": 250,
+    "errorRateBelow": 0.01,
+    "droppedIterations": 0
+  },
+  "host": {
+    "cpu": "AMD Ryzen 7 8845H w/ Radeon 780M Graphics",
+    "logicalCpus": 16,
+    "memoryGiB": 26.7
+  },
+  "persistence": "Redis AOF appendfsync always",
+  "k6": "2.3.0",
+  "apiReplicas": 4,
+  "preAllocatedVUs": 512,
+  "maxVUs": 512,
+  "highestPassingTargetRps": null,
+  "confirmedTargetRps": null,
+  "results": [
+    {
+      "stage": 1,
+      "label": "smoke",
+      "targetRps": 50,
+      "seconds": 3,
+      "accepted": 151,
+      "rejected": 0,
+      "dropped": 0,
+      "acceptedRps": 50.3,
+      "p95ms": 3.7,
+      "p99ms": 4.7,
+      "signingP95ms": 1,
+      "pass": true,
+      "resourcePeaks": {},
+      "apiTotalCpuPercentPeak": 0
+    },
+    {
+      "stage": 2,
+      "label": "sweep",
+      "targetRps": 10000,
+      "seconds": 15,
+      "accepted": 149660,
+      "rejected": 0,
+      "dropped": 341,
+      "acceptedRps": 9977.3,
+      "p95ms": 20.18,
+      "p99ms": 39.18,
+      "signingP95ms": 1,
+      "pass": false,
+      "resourcePeaks": {
+        "k6": {
+          "cpuPercent": 475.67,
+          "memory": "269.3MiB / 26.71GiB"
+        },
+        "api": {
+          "cpuPercent": 110.68,
+          "memory": "114.5MiB / 26.71GiB"
+        },
+        "redis": {
+          "cpuPercent": 38.08,
+          "memory": "9.25MiB / 26.71GiB"
+        }
+      },
+      "apiTotalCpuPercentPeak": 358.86
+    }
+  ],
+  "shortStageFailureUpperBoundRps": 10000
+}
