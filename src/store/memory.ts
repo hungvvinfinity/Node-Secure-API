@@ -1,0 +1,136 @@
+import { type DeviceRecord, type Platform, SecurityError } from '../contracts.js';
+import type { CommitResult, SecurityStore } from './types.js';
+import { validSequence, validateDeviceRecord } from './validation.js';
+
+interface ChallengeEntry {
+  platform: Platform;
+  expiresAt: number;
+}
+
+export interface MemorySecurityStoreOptions {
+  now?: () => number;
+}
+
+const SEQUENCE_PATTERN = /^(?:0|[1-9]\d*)$/;
+const UINT32_MAX = 4294967295;
+
+/**
+ * In-memory security store designed for unit and integration testing.
+ * NEVER use in production environments.
+ */
+export class MemorySecurityStore implements SecurityStore {
+  private readonly challenges = new Map<string, ChallengeEntry>();
+  private readonly devices = new Map<string, DeviceRecord>();
+  private readonly now: () => number;
+
+  constructor(options: MemorySecurityStoreOptions = {}) {
+    this.now = options.now ?? (() => Date.now());
+  }
+
+  async saveChallenge(challenge: string, platform: Platform, ttlSeconds: number): Promise<void> {
+    if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 3600 ||
+        (platform !== 'android' && platform !== 'ios')) throw new SecurityError('INVALID_CHALLENGE', 400);
+    const expiresAt = this.now() + ttlSeconds * 1000;
+    this.challenges.set(challenge, { platform, expiresAt });
+  }
+
+  async consumeChallenge(challenge: string): Promise<{ platform: Platform } | null> {
+    const entry = this.challenges.get(challenge);
+    if (!entry) {
+      return null;
+    }
+
+    // Always delete challenge upon first access (single-use guarantee)
+    this.challenges.delete(challenge);
+
+    // Fail closed if challenge expired (uses >= as required)
+    if (this.now() >= entry.expiresAt) {
+      return null;
+    }
+
+    return { platform: entry.platform };
+  }
+
+  async createDeviceNX(device: DeviceRecord): Promise<boolean> {
+    if (this.devices.has(device.deviceId)) {
+      return false;
+    }
+
+    this.validateStoredDevice(device);
+    this.devices.set(device.deviceId, structuredClone(device));
+    return true;
+  }
+
+  async getDevice(deviceId: string): Promise<DeviceRecord | null> {
+    const device = this.devices.get(deviceId);
+    if (!device) {
+      return null;
+    }
+    this.validateStoredDevice(device);
+    const result = structuredClone(device);
+    delete result.metadata.receipt;
+    return result;
+  }
+
+  async commitSequence(
+    deviceId: string,
+    expectedPublicKeyPem: string,
+    newSequence: string,
+    newSignCount?: number
+  ): Promise<CommitResult> {
+    if (!validSequence(newSequence)) throw new SecurityError('INVALID_SEQUENCE', 400);
+    const device = this.devices.get(deviceId);
+    if (!device) {
+      return { ok: false, reason: 'NOT_FOUND' };
+    }
+
+    this.validateStoredDevice(device);
+
+    if (device.publicKeyPem !== expectedPublicKeyPem) {
+      return { ok: false, reason: 'KEY_MISMATCH' };
+    }
+
+    // Require iOS signCount when platform is ios (fail closed before sequence advance)
+    if (device.platform === 'ios') {
+      if (newSignCount === undefined || newSignCount === null) {
+        return { ok: false, reason: 'MISSING_SIGN_COUNT' };
+      }
+      if (!Number.isInteger(newSignCount) || newSignCount < 1 || newSignCount > UINT32_MAX) {
+        return { ok: false, reason: 'COUNTER_ROLLBACK' };
+      }
+      const currentCount = device.signCount ?? 0;
+      if (newSignCount <= currentCount) {
+        return { ok: false, reason: 'COUNTER_ROLLBACK' };
+      }
+    }
+
+    // Strict BigInt comparison for decimal monotonic sequence
+    const currentSeqBig = BigInt(device.lastSequence || '0');
+    const newSeqBig = BigInt(newSequence);
+
+    if (newSeqBig <= currentSeqBig) {
+      return { ok: false, reason: 'REPLAY', currentSequence: device.lastSequence };
+    }
+
+    // Apply updates atomically
+    if (device.platform === 'ios' && newSignCount !== undefined) {
+      device.signCount = newSignCount;
+    }
+
+    device.lastSequence = newSequence;
+    return { ok: true };
+  }
+
+  async ping(): Promise<boolean> {
+    return true;
+  }
+
+  async close(): Promise<void> {
+    this.challenges.clear();
+    this.devices.clear();
+  }
+
+  private validateStoredDevice(device: DeviceRecord): void {
+    validateDeviceRecord(device);
+  }
+}

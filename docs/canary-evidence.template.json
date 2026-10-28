@@ -1,0 +1,19 @@
+{
+  "runId": "REPLACE_WITH_CANARY_RUN_ID",
+  "status": "NOT_RUN",
+  "artifactDigest": null,
+  "appBuild": null,
+  "platform": null,
+  "deviceModel": null,
+  "osVersion": null,
+  "appIdentityVerified": false,
+  "hardwareAttestationVerified": false,
+  "trustAnchorFingerprint": null,
+  "preflightReport": null,
+  "cases": [],
+  "redisPersistencePolicy": null,
+  "proxyRawByteIntegrityVerified": false,
+  "observedAt": null,
+  "reviewer": null,
+  "notes": "No private keys, full receipts, user payloads or credentials. Each case records PASS/FAIL/NOT_RUN, expected/actual error code, sequence/counter before/after and redacted trace IDs."
+}

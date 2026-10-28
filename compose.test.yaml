@@ -1,0 +1,26 @@
+name: node-secure-api-test
+services:
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-test-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+  tests:
+    build:
+      context: .
+      target: test
+      network: ${DOCKER_BUILD_NETWORK:-default}
+    environment:
+      NODE_ENV: test
+      REDIS_TEST_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    init: true
+volumes:
+  redis-test-data:
