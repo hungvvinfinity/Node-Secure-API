@@ -2,7 +2,7 @@
 
 Backend Node.js 24 + TypeScript dựa trên [SECURITY_SOLUTION.md](SECURITY_SOLUTION.md). Android dùng hardware Key Attestation; iOS dùng Apple App Attest. Hai platform triển khai cùng [DeviceSecurityProvider](src/contracts.ts); challenge, canonical request và Redis replay guard dùng chung.
 
-[Kế hoạch và phase gates](IMPLEMENTATION_PLAN.md) · [Kế hoạch tương thích Android](docs/ANDROID_COMPATIBILITY_PLAN.md) · [Review và kết quả xác minh](docs/REVIEW.md) · [Ma trận kiểm thử](docs/TEST_MATRIX.md) · [Triển khai](docs/DEPLOYMENT.md) · [Giao thức client](docs/CLIENT_PROTOCOL.md) · [Nguồn và quy trình cập nhật](docs/SECURITY_SOURCES.md)
+[Kế hoạch và phase gates](IMPLEMENTATION_PLAN.md) · [Kế hoạch scale ngang và chống rủi ro Redis](docs/SCALING_AND_RESILIENCE_PLAN.md) · [Kế hoạch tương thích Android](docs/ANDROID_COMPATIBILITY_PLAN.md) · [Review và kết quả xác minh](docs/REVIEW.md) · [Ma trận kiểm thử](docs/TEST_MATRIX.md) · [Triển khai](docs/DEPLOYMENT.md) · [Giao thức client](docs/CLIENT_PROTOCOL.md) · [Nguồn và quy trình cập nhật](docs/SECURITY_SOURCES.md)
 
 ## Chạy toàn bộ project bằng Docker Compose
 
