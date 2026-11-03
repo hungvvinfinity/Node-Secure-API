@@ -71,21 +71,33 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:layout_marginBottom="12dp">
+        android:layout_marginBottom="4dp">
 
         <TextView
             android:id="@+id/tvHwLevel"
-            android:layout_width="wrap_content"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
+            android:layout_weight="1"
             android:text="Hardware Level: Detecting..."
             android:textColor="#FFD54F"
-            android:textSize="12sp"
+            android:textSize="11sp"
             android:textStyle="bold" />
 
-        <View
-            android:layout_width="0dp"
-            android:layout_height="1dp"
-            android:layout_weight="1" />
+        <TextView
+            android:id="@+id/tvLease"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Lease: Permanent"
+            android:textColor="#81D4FA"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginBottom="12dp">
 
         <TextView
             android:id="@+id/tvSequence"

@@ -38,6 +38,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvDeviceId: TextView
     private lateinit var tvTier: TextView
     private lateinit var tvHwLevel: TextView
+    private lateinit var tvLease: TextView
     private lateinit var tvSequence: TextView
     private lateinit var tvConsole: TextView
     private lateinit var svLog: ScrollView
@@ -71,6 +72,7 @@ class MainActivity : AppCompatActivity() {
         tvDeviceId = findViewById(R.id.tvDeviceId)
         tvTier = findViewById(R.id.tvTier)
         tvHwLevel = findViewById(R.id.tvHwLevel)
+        tvLease = findViewById(R.id.tvLease)
         tvSequence = findViewById(R.id.tvSequence)
         tvConsole = findViewById(R.id.tvConsole)
         svLog = findViewById(R.id.svLog)
@@ -89,15 +91,15 @@ class MainActivity : AppCompatActivity() {
 
         // Detect and display hardware security level (StrongBox, TEE, or Software)
         val hwLevel = KeystoreManager.getOrDetectHardwareSecurityLevel(this)
-        tvHwLevel.text = "Hardware Level: $hwLevel"
+        tvHwLevel.text = "HW: $hwLevel"
         log("Hệ thống khởi tạo thành công. Phần cứng: $hwLevel | Server: ${initialClient.baseUrl}")
 
         // 1. Button Register
         btnRegister.setOnClickListener {
             runAction {
                 val api = getOrCreateClient() ?: return@runAction
-                log("--- BẮT ĐẦU ĐĂNG KÝ THIẾT BỊ ---")
-                log("1. Gửi POST /api/auth/challenge tới ${api.baseUrl}...")
+                log("--- BẮT ĐẦU ĐĂNG KÝ THIẾT BỊ (DUAL-TIER) ---")
+                log("1. Xin challenge & PoW puzzle từ ${api.baseUrl}...")
                 lastSignedPacket = null
 
                 val result = api.registerDeviceOnce(force = true)
@@ -105,8 +107,13 @@ class MainActivity : AppCompatActivity() {
 
                 if (result.isSuccess) {
                     val assignedId = result.getOrNull()
-                    log("✅ Đăng ký thành công! Server cấp Device ID: $assignedId")
-                    log("Đã lưu khóa EC P-256 trong Keystore và reset sequence về 0.")
+                    val tierName = if (api.tier == "hardware") "Tier 1: Hardware VIP" else "Tier 2: Software Protected (PoW)"
+                    log("✅ Đăng ký thành công! Cấp bậc: $tierName | Device ID: $assignedId")
+                    if (api.tier == "software") {
+                        log("ℹ️ Software Tier: Kích hoạt Rolling Lease 2h và Tarpit Delay 3.0s chống botnet.")
+                    } else {
+                        log("ℹ️ Hardware VIP Tier: Lease vĩnh viễn, 0ms latency fast-track.")
+                    }
                 } else {
                     log("❌ Đăng ký thất bại: ${result.exceptionOrNull()?.message}")
                 }
@@ -120,7 +127,7 @@ class MainActivity : AppCompatActivity() {
                 log("--- GỌI API TAROT BẢO VỆ ---")
 
                 if (!api.isDeviceRegistered()) {
-                    log("Thiết bị chưa đăng ký. Đang tự động đăng ký với server...")
+                    log("Thiết bị chưa đăng ký hoặc lease đã hết hạn. Đang đăng ký tự động...")
                     val regResult = api.registerDeviceOnce(force = true)
                     updateHeaderStatus(api)
                     if (regResult.isFailure) {
@@ -129,7 +136,18 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
+                // Check silent lease renewal if lease is about to expire
+                if (SecurityTierManager.isLeaseExpiringSoon(this@MainActivity)) {
+                    log("ℹ️ Lease sắp hết hạn (< 5 phút), thực hiện Silent Renewal ngầm...")
+                    api.registerDeviceOnce(force = true)
+                    updateHeaderStatus(api)
+                }
+
                 log("Đang tạo chữ ký số SHA256withECDSA với canonical string và gửi request...")
+                if (api.tier == "software") {
+                    log("⏳ Đang xử lý qua hàng rào Tarpit Delay 3.0s của Software Tier...")
+                }
+
                 var savedPacket: SavedSignedPacket? = null
                 val idempotencyKey = UUID.randomUUID().toString()
 
@@ -153,15 +171,17 @@ class MainActivity : AppCompatActivity() {
                 var tarotResult = doReadTarot()
                 val failure = tarotResult.exceptionOrNull() as? ApiResponseException
 
-                // Auto-recover if server restarted or device state lost (401)
-                if (failure?.statusCode == 401 && failure.errorCode in setOf("OTP_REQUIRED", "DEVICE_NOT_REGISTERED", "DEVICE_NOT_FOUND")) {
-                    log("Server yêu cầu đồng bộ lại thiết bị [401 ${failure.errorCode}]. Đang re-register...")
+                // Auto-recover on lease expiration or device state loss
+                if (failure?.statusCode == 401 && failure.errorCode in setOf("OTP_REQUIRED", "DEVICE_NOT_REGISTERED", "DEVICE_NOT_FOUND", "LEASE_EXPIRED", "DEVICE_LEASE_EXPIRED")) {
+                    log("Server báo [401 ${failure.errorCode}]. Đang thực hiện Silent Renewal ngầm...")
                     val reReg = api.registerDeviceOnce(force = true)
                     updateHeaderStatus(api)
                     if (reReg.isSuccess) {
-                        log("Đăng ký lại thành công! Thử lại request Tarot...")
+                        log("Silent Renewal thành công! Đang tự động gọi lại request Tarot...")
                         tarotResult = doReadTarot()
                     }
+                } else if (failure?.statusCode == 429 && failure.errorCode == "CONCURRENT_REQUEST_DISALLOWED") {
+                    log("🛡️ CONCURRENCY LOCK: Software Tier chặn yêu cầu đồng thời (tối đa 1 request in-flight)!")
                 }
 
                 updateHeaderStatus(api)
@@ -325,9 +345,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateHeaderStatus(api: ApiClient) {
+        val tierEnum = SecurityTierManager.determineSecurityTier(this)
         tvDeviceId.text = "Device ID: ${api.deviceId ?: "(chưa đăng ký)"}"
-        tvTier.text = "Tier: ${SecurityTierManager.determineSecurityTier(this)}"
+        tvTier.text = tierEnum.displayName
         tvSequence.text = "Seq: ${AtomicSequenceGenerator.currentSequence()}"
+
+        val remainingMinutes = SecurityTierManager.getLeaseRemainingMinutes(this)
+        tvLease.text = when {
+            api.tier == "hardware" -> "Lease: Vĩnh viễn (VIP)"
+            remainingMinutes > 0 -> "Lease: Còn ${remainingMinutes}m (Tarpit 3s)"
+            else -> "Lease: Hết hạn (Cần renew)"
+        }
     }
 
     private fun runAction(action: suspend () -> Unit) {

@@ -12,41 +12,74 @@ import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
+import java.security.PublicKey
 import java.security.Signature
 import java.security.spec.ECGenParameterSpec
 
 /**
- * Manages hardware-backed EC P-256 (secp256r1) key pairs in AndroidKeyStore.
+ * Dual-Tier Key Management for Node-Secure-API Android Client:
  *
- * Implements Android Key Attestation requirements:
- * - Real hardware keystore (StrongBox preferred with TEE fallback).
- * - Attestation challenge set to UTF-8 bytes of the 64-character server challenge hex string.
- * - Key purpose: strictly PURPOSE_SIGN (asymmetric private key used exclusively for signing).
- * - Non-interactive API protection: userAuthenticationRequired is disabled (false) to prevent
- *   session invalidation on lock-screen credential changes.
- * - Strict DER-encoded ECDSA signatures (r, s sequence) base64 without wrapping.
+ * 1. Tier 1 (Hardware VIP):
+ *    - Hardware-backed EC P-256 (secp256r1) key generated in AndroidKeyStore.
+ *    - Bound to server attestation challenge.
+ *    - StrongBox preferred with TEE fallback.
+ *    - Strictly PURPOSE_SIGN.
+ *    - Exports X.509 certificate chain (Google Hardware Attestation Root).
+ *
+ * 2. Tier 2 (Software Protected):
+ *    - Standard EC P-256 key pair generated when hardware attestation is unavailable
+ *      (e.g., budget chipsets, unlocked bootloaders, devices without Google Play Services).
+ *    - Exports standard X.509 SubjectPublicKeyInfo (SPKI) PEM.
+ *    - Authenticated via client-side Proof of Work (PoW).
+ *
+ * Uniform Signing Interface:
+ * Both tiers use SHA256withECDSA producing strict DER-encoded ASN.1 SEQUENCE (r, s) base64.
  */
 object KeystoreManager {
-    const val KEY_ALIAS = "NodeSecureHardwareKey"
+    const val HARDWARE_KEY_ALIAS = "NodeSecureHardwareKey"
+    const val SOFTWARE_KEY_ALIAS = "NodeSecureSoftwareKey"
     private const val PREFS_NAME = "app_secure_prefs"
     private const val KEY_CACHED_HW_LEVEL = "CACHED_HW_SECURITY_LEVEL"
+    private const val KEY_ACTIVE_TIER = "ACTIVE_KEY_TIER"
 
     private val keyStore: KeyStore
         get() = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
 
+    // In-memory software fallback key pair if AndroidKeyStore fails completely
+    private var softwareFallbackKeyPair: KeyPair? = null
+
+    // Current active tier: "hardware" or "software"
+    var activeTier: String = "hardware"
+        get() {
+            // Auto-heal if activeTier is default "hardware" but hardware key is absent and software key is present
+            if (field == "hardware" && !keyStore.containsAlias(HARDWARE_KEY_ALIAS) &&
+                (keyStore.containsAlias(SOFTWARE_KEY_ALIAS) || softwareFallbackKeyPair != null)) {
+                return "software"
+            }
+            return field
+        }
+        internal set
+
+    // Optional mock signer for unit tests running on local JVM where AndroidKeyStore is unavailable
+    internal var testSigner: ((String) -> String)? = null
+
     /**
-     * Generates a new EC P-256 key pair bound to the server attestation challenge.
-     * Tries StrongBox first if supported by hardware; gracefully falls back to TEE.
-     * Uses strictly PURPOSE_SIGN for the private signing key.
+     * TIER 1: Generates a hardware-attested EC P-256 key pair bound to the challenge.
+     * Tries StrongBox first if supported; falls back to TEE.
+     * Throws an exception if device hardware does not support hardware attestation.
      */
     @Synchronized
     fun generateAttestedKeyPair(challengeHex: String, context: Context? = null): KeyPair {
         require(challengeHex.isNotEmpty()) { "Challenge must not be empty" }
         require(challengeHex.length == 64) { "Challenge must be a 64-character hex string" }
 
-        if (keyStore.containsAlias(KEY_ALIAS)) {
-            keyStore.deleteEntry(KEY_ALIAS)
+        if (keyStore.containsAlias(HARDWARE_KEY_ALIAS)) {
+            keyStore.deleteEntry(HARDWARE_KEY_ALIAS)
         }
+        if (keyStore.containsAlias(SOFTWARE_KEY_ALIAS)) {
+            keyStore.deleteEntry(SOFTWARE_KEY_ALIAS)
+        }
+        softwareFallbackKeyPair = null
 
         val hasStrongBox = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && context != null) {
             context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
@@ -54,14 +87,12 @@ object KeystoreManager {
             false
         }
 
-        // Protocol requirement: challenge bytes for AndroidKeyStore setAttestationChallenge
-        // MUST BE the UTF-8 bytes of the hex string, NOT hex-decoded bytes.
         val challengeBytes = challengeHex.toByteArray(Charsets.UTF_8)
 
         fun createSpec(useStrongBox: Boolean): KeyGenParameterSpec {
             val builder = KeyGenParameterSpec.Builder(
-                KEY_ALIAS,
-                KeyProperties.PURPOSE_SIGN // Strictly PURPOSE_SIGN per security review
+                HARDWARE_KEY_ALIAS,
+                KeyProperties.PURPOSE_SIGN
             )
                 .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
                 .setDigests(KeyProperties.DIGEST_SHA256)
@@ -74,49 +105,129 @@ object KeystoreManager {
             return builder.build()
         }
 
-        fun generateWithSpec(useStrongBox: Boolean): KeyPair {
+        fun generate(useStrongBox: Boolean): KeyPair {
             val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
             kpg.initialize(createSpec(useStrongBox))
             return kpg.generateKeyPair()
         }
 
-        return if (hasStrongBox) {
+        val keyPair = if (hasStrongBox) {
             try {
-                generateWithSpec(useStrongBox = true)
+                generate(useStrongBox = true)
             } catch (_: Throwable) {
-                // StrongBox failed or unavailable, fallback to TEE
-                generateWithSpec(useStrongBox = false)
+                generate(useStrongBox = false)
             }
         } else {
-            generateWithSpec(useStrongBox = false)
+            generate(useStrongBox = false)
         }
+
+        activeTier = "hardware"
+        context?.applicationContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            ?.edit()?.putString(KEY_ACTIVE_TIER, "hardware")?.apply()
+
+        return keyPair
     }
 
     /**
-     * Exports the X.509 certificate chain from leaf to root as a list of DER Base64 strings.
+     * TIER 2: Generates a software EC P-256 key pair without hardware attestation.
+     * First attempts creation in AndroidKeyStore (without attestation challenge) so private
+     * key remains protected by OS. If that fails, creates standard in-memory EC key.
+     */
+    @Synchronized
+    fun generateSoftwareKeyPair(context: Context? = null): KeyPair {
+        if (keyStore.containsAlias(HARDWARE_KEY_ALIAS)) {
+            keyStore.deleteEntry(HARDWARE_KEY_ALIAS)
+        }
+        val keyPair = try {
+            if (keyStore.containsAlias(SOFTWARE_KEY_ALIAS)) {
+                keyStore.deleteEntry(SOFTWARE_KEY_ALIAS)
+            }
+            val spec = KeyGenParameterSpec.Builder(
+                SOFTWARE_KEY_ALIAS,
+                KeyProperties.PURPOSE_SIGN
+            )
+                .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                .setDigests(KeyProperties.DIGEST_SHA256)
+                .setUserAuthenticationRequired(false)
+                .build()
+
+            val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+            kpg.initialize(spec)
+            kpg.generateKeyPair()
+        } catch (_: Throwable) {
+            // Fallback to standard Java/BouncyCastle EC key generator
+            val standardKpg = KeyPairGenerator.getInstance("EC")
+            standardKpg.initialize(ECGenParameterSpec("secp256r1"))
+            val pair = standardKpg.generateKeyPair()
+            softwareFallbackKeyPair = pair
+            pair
+        }
+
+        activeTier = "software"
+        context?.applicationContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            ?.edit()?.putString(KEY_ACTIVE_TIER, "software")?.apply()
+
+        return keyPair
+    }
+
+    /**
+     * Exports the X.509 certificate chain from leaf to root as DER Base64 strings (Tier 1).
      */
     @Synchronized
     fun getCertificateChainBase64(): List<String> {
-        val chain = keyStore.getCertificateChain(KEY_ALIAS)
-            ?: throw IllegalStateException("Missing attestation certificate chain for alias $KEY_ALIAS")
+        val chain = keyStore.getCertificateChain(HARDWARE_KEY_ALIAS)
+            ?: throw IllegalStateException("Missing attestation certificate chain for alias $HARDWARE_KEY_ALIAS")
         return chain.map { cert ->
             Base64.encodeToString(cert.encoded, Base64.NO_WRAP)
         }
     }
 
-    // Optional mock signer for unit tests running on local JVM where AndroidKeyStore is unavailable
-    internal var testSigner: ((String) -> String)? = null
+    /**
+     * Exports a Public Key in standard SPKI PEM format (Tier 2).
+     */
+    fun exportSpkiPem(publicKey: PublicKey): String {
+        val derBytes = publicKey.encoded
+        val b64 = Base64.encodeToString(derBytes, Base64.NO_WRAP)
+        val wrapped = b64.chunked(64).joinToString("\n")
+        return "-----BEGIN PUBLIC KEY-----\n$wrapped\n-----END PUBLIC KEY-----"
+    }
 
     /**
-     * Signs the canonical UTF-8 string with the hardware private key using SHA256withECDSA.
-     * Returns standard DER-encoded ASN.1 SEQUENCE (r, s) as canonical Base64 (no wrap).
+     * Gets the software public key in SPKI PEM format (Tier 2).
+     */
+    @Synchronized
+    fun getSoftwarePublicKeyPem(): String {
+        val pubKey: PublicKey = if (keyStore.containsAlias(SOFTWARE_KEY_ALIAS)) {
+            val cert = keyStore.getCertificate(SOFTWARE_KEY_ALIAS)
+            cert?.publicKey ?: error("Cannot retrieve public key for $SOFTWARE_KEY_ALIAS")
+        } else {
+            softwareFallbackKeyPair?.public
+                ?: error("No software key pair currently available")
+        }
+        return exportSpkiPem(pubKey)
+    }
+
+    /**
+     * Signs the canonical UTF-8 string using SHA256withECDSA on the active private key.
+     * Uniformly returns standard DER-encoded ASN.1 SEQUENCE (r, s) as canonical Base64.
      */
     @Synchronized
     fun signData(canonicalString: String): String {
         testSigner?.let { return it(canonicalString) }
 
-        val privateKey = keyStore.getKey(KEY_ALIAS, null) as? PrivateKey
-            ?: throw IllegalStateException("Private key not found for alias $KEY_ALIAS")
+        val privateKey: PrivateKey = if (activeTier == "hardware") {
+            keyStore.getKey(HARDWARE_KEY_ALIAS, null) as? PrivateKey
+                ?: throw IllegalStateException("Hardware private key not found ($HARDWARE_KEY_ALIAS)")
+        } else {
+            if (keyStore.containsAlias(SOFTWARE_KEY_ALIAS)) {
+                keyStore.getKey(SOFTWARE_KEY_ALIAS, null) as? PrivateKey
+                    ?: softwareFallbackKeyPair?.private
+                    ?: throw IllegalStateException("Software private key not found ($SOFTWARE_KEY_ALIAS)")
+            } else {
+                softwareFallbackKeyPair?.private
+                    ?: throw IllegalStateException("Software private key not found")
+            }
+        }
 
         val signer = Signature.getInstance("SHA256withECDSA")
         signer.initSign(privateKey)
@@ -127,34 +238,42 @@ object KeystoreManager {
     }
 
     /**
-     * Checks if the device key exists in AndroidKeyStore.
+     * Checks if the device key exists for the active tier.
      */
     @Synchronized
-    fun isDeviceKeyReady(): Boolean = keyStore.containsAlias(KEY_ALIAS)
-
-    /**
-     * Deletes the device key from AndroidKeyStore.
-     */
-    @Synchronized
-    fun deleteKey() {
-        if (keyStore.containsAlias(KEY_ALIAS)) {
-            keyStore.deleteEntry(KEY_ALIAS)
+    fun isDeviceKeyReady(): Boolean {
+        return if (activeTier == "hardware") {
+            keyStore.containsAlias(HARDWARE_KEY_ALIAS)
+        } else {
+            keyStore.containsAlias(SOFTWARE_KEY_ALIAS) || softwareFallbackKeyPair != null
         }
     }
 
     /**
+     * Deletes all local keys (both hardware and software).
+     */
+    @Synchronized
+    fun deleteKey() {
+        if (keyStore.containsAlias(HARDWARE_KEY_ALIAS)) {
+            keyStore.deleteEntry(HARDWARE_KEY_ALIAS)
+        }
+        if (keyStore.containsAlias(SOFTWARE_KEY_ALIAS)) {
+            keyStore.deleteEntry(SOFTWARE_KEY_ALIAS)
+        }
+        softwareFallbackKeyPair = null
+        activeTier = "hardware"
+    }
+
+    /**
      * Detects hardware security level: StrongBox, TEE, or Software.
-     * Prioritizes directly querying KeyInfo of the real KEY_ALIAS if it already exists,
-     * then checks cache, then falls back to probing.
      */
     @Synchronized
     fun getOrDetectHardwareSecurityLevel(context: Context): String {
         val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-        // 1. If real key KEY_ALIAS exists, directly inspect its hardware KeyInfo
-        if (keyStore.containsAlias(KEY_ALIAS)) {
+        if (keyStore.containsAlias(HARDWARE_KEY_ALIAS)) {
             try {
-                val privateKey = keyStore.getKey(KEY_ALIAS, null) as? PrivateKey
+                val privateKey = keyStore.getKey(HARDWARE_KEY_ALIAS, null) as? PrivateKey
                 if (privateKey != null) {
                     val factory = KeyFactory.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
                     val keyInfo = factory.getKeySpec(privateKey, KeyInfo::class.java)
@@ -171,16 +290,12 @@ object KeystoreManager {
                     prefs.edit().putString(KEY_CACHED_HW_LEVEL, level).apply()
                     return level
                 }
-            } catch (_: Throwable) {
-                // If KeyInfo query on existing key fails, continue to fallback detection
-            }
+            } catch (_: Throwable) {}
         }
 
-        // 2. Check cached hardware level
         val cached = prefs.getString(KEY_CACHED_HW_LEVEL, null)
         if (!cached.isNullOrEmpty()) return cached
 
-        // 3. Probing fallback
         val detected = try {
             val hasStrongBox = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)

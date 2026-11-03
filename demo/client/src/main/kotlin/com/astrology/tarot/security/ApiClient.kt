@@ -3,7 +3,6 @@ package com.astrology.tarot.security
 import android.content.Context
 import android.content.SharedPreferences
 import com.google.gson.Gson
-import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -16,16 +15,20 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.util.concurrent.TimeUnit
+
+class HardwareAttestationRejectedException(message: String) : Exception(message)
 
 /**
- * Android API client for Node-Secure-API server.
+ * Dual-Tier Android API client for Node-Secure-API server.
  *
  * Responsibilities:
- * 1. Obtains hardware attestation challenge from /api/auth/challenge.
- * 2. Generates EC P-256 key pair in AndroidKeyStore with the challenge UTF-8.
- * 3. Registers device by submitting certificate chain to /api/auth/register-device.
- * 4. Persists the server-issued deviceId and resets sequence counter to 0.
- * 5. Executes signed requests to protected business endpoints (/api/tarot/read).
+ * 1. Obtains hardware attestation challenge + PoW puzzle from /api/auth/challenge.
+ * 2. Attempts Tier 1 (Hardware VIP) registration via AndroidKeyStore Key Attestation.
+ * 3. Gracefully falls back to Tier 2 (Software Protected) by solving the PoW puzzle
+ *    and registering standard EC P-256 SPKI PEM.
+ * 4. Manages rolling 2-hour lease for software tier with silent background renewal.
+ * 5. Respects client-side serialization queue and OkHttp timeouts for 3.0s tarpit delay.
  */
 class ApiClient {
     private val context: Context?
@@ -36,15 +39,23 @@ class ApiClient {
     val baseUrl: String
     var deviceId: String? = null
         private set
+    var tier: String = "hardware"
+        private set
+    var leaseExpiresAt: Long = 0L
+        private set
 
-    // Independent un-intercepted client for registration & control calls
+    // Independent un-intercepted client for registration & control calls (with adequate timeout for PoW/reg)
     private val controlClient: OkHttpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(30, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(false)
         .followRedirects(false)
         .followSslRedirects(false)
         .build()
 
     // Protected client configured with AttestationSigningInterceptor
+    // readTimeout >= 30s to comfortably tolerate 3.0s tarpit delay on Software Tier
     val httpClient: OkHttpClient
 
     /**
@@ -60,7 +71,16 @@ class ApiClient {
                 ?: DEFAULT_BASE_URL
         )
         this.deviceId = sp.getString(KEY_DEVICE_ID, null)
+        this.tier = sp.getString(KEY_TIER, "hardware") ?: "hardware"
+        this.leaseExpiresAt = sp.getLong(KEY_EXPIRES_AT, 0L)
+
+        // Restore KeystoreManager active tier on app startup
+        KeystoreManager.activeTier = this.tier
+
         this.httpClient = OkHttpClient.Builder()
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS) // Accommodates 3.0s tarpit delay
+            .writeTimeout(30, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false) // Must be false: retries must re-sequence and re-sign
             .followRedirects(false)
             .followSslRedirects(false)
@@ -76,34 +96,52 @@ class ApiClient {
     internal constructor(
         baseUrl: String,
         customHttpClient: OkHttpClient,
-        initialDeviceId: String? = "test-device-id"
+        initialDeviceId: String? = "test-device-id",
+        initialTier: String = "hardware"
     ) {
         this.context = null
         this.prefs = null
         this.baseUrl = normalizeUrl(baseUrl)
         this.deviceId = initialDeviceId
+        this.tier = initialTier
+        this.leaseExpiresAt = 0L
         this.httpClient = customHttpClient
     }
 
     /**
-     * Checks if the device has a valid registered deviceId, matching server URL,
-     * and active hardware key in AndroidKeyStore.
+     * Checks if the device has a valid registered deviceId and active key.
+     * Also checks if the lease has not expired for software tier.
      */
     fun isDeviceRegistered(): Boolean {
         val sp = prefs ?: return !deviceId.isNullOrEmpty()
         val registered = sp.getBoolean(KEY_REGISTERED, false)
         val registeredUrl = sp.getString(KEY_REGISTERED_URL, null)
-        return registered &&
-                registeredUrl == baseUrl &&
-                !deviceId.isNullOrEmpty() &&
-                KeystoreManager.isDeviceKeyReady()
+
+        if (!registered || registeredUrl != baseUrl || deviceId.isNullOrEmpty() || !KeystoreManager.isDeviceKeyReady()) {
+            return false
+        }
+
+        if (tier == "software") {
+            val expiresAt = sp.getLong(KEY_EXPIRES_AT, 0L)
+            if (expiresAt > 0 && System.currentTimeMillis() >= expiresAt) {
+                return false // Lease expired
+            }
+        }
+
+        return true
     }
 
+    // Optional mock registration handler for JVM unit tests where Android Context is unavailable
+    internal var testRegistrationHandler: (suspend (force: Boolean) -> Result<String>)? = null
+
     /**
-     * Registers the device with the Node-Secure-API server.
-     * If force is false and device is already registered, returns immediately.
+     * Registers the device with the Node-Secure-API server using Dual-Tier Strategy:
+     * 1. Request challenge and PoW params from /api/auth/challenge.
+     * 2. Try Tier 1 (Hardware Attestation).
+     * 3. Fallback to Tier 2 (Software Key + PoW solution) if hardware attestation fails or is rejected.
      */
     suspend fun registerDeviceOnce(force: Boolean = false): Result<String> = registrationMutex.withLock {
+        testRegistrationHandler?.let { return it(force) }
         withContext(Dispatchers.IO) {
             try {
                 if (!force && isDeviceRegistered()) {
@@ -112,66 +150,168 @@ class ApiClient {
 
                 val sp = checkNotNull(prefs) { "Registration requires Android Context" }
 
-                // Step 1: Request single-use challenge from server
+                // Step 1: Request challenge + PoW parameters
                 val challengeReq = Request.Builder()
                     .url("$baseUrl/api/auth/challenge")
                     .post(gson.toJson(mapOf("platform" to "android")).toRequestBody(jsonMediaType))
                     .build()
 
-                val challenge = controlClient.newCall(challengeReq).execute().use { response ->
+                val (challenge, powSalt, powDifficulty) = controlClient.newCall(challengeReq).execute().use { response ->
                     val bodyStr = response.body?.string().orEmpty()
                     if (!response.isSuccessful) {
                         throw IOException("Challenge request failed (${response.code}): $bodyStr")
                     }
                     val json = JsonParser.parseString(bodyStr).asJsonObject
-                    json.get("challenge")?.asString
+                    val ch = json.get("challenge")?.asString
                         ?: throw IllegalStateException("Missing challenge in response: $bodyStr")
+
+                    // Extract PoW puzzle parameters
+                    val powObj = json.getAsJsonObject("pow") ?: json.getAsJsonObject("powInfo")
+                    val salt = powObj?.get("salt")?.asString ?: ""
+                    val diff = powObj?.get("difficulty")?.asInt ?: 18
+                    Triple(ch, salt, diff)
                 }
 
-                // Step 2: Invalidate existing registration status and generate new hardware key
                 sp.edit().putBoolean(KEY_REGISTERED, false).apply()
-                KeystoreManager.generateAttestedKeyPair(challenge, context)
-                val certChain = KeystoreManager.getCertificateChainBase64()
 
-                // Step 3: Register device on server
-                val registerPayload = gson.toJson(
-                    mapOf(
-                        "challenge" to challenge,
-                        "certificateChain" to certChain
+                var assignedDeviceId: String? = null
+                var assignedTier = "hardware"
+                var assignedExpiresAt = 0L
+
+                // Step 2: Attempt Tier 1: Hardware VIP Registration
+                var hardwareSuccess = false
+                var challengeConsumed = false
+                try {
+                    KeystoreManager.generateAttestedKeyPair(challenge, context)
+                    val certChain = KeystoreManager.getCertificateChainBase64()
+
+                    val hardwarePayload = gson.toJson(
+                        mapOf(
+                            "challenge" to challenge,
+                            "certificateChain" to certChain
+                        )
                     )
-                )
 
-                val registerReq = Request.Builder()
-                    .url("$baseUrl/api/auth/register-device")
-                    .post(registerPayload.toRequestBody(jsonMediaType))
-                    .build()
+                    val regReq = Request.Builder()
+                        .url("$baseUrl/api/auth/register-device")
+                        .post(hardwarePayload.toRequestBody(jsonMediaType))
+                        .build()
 
-                val assignedDeviceId = controlClient.newCall(registerReq).execute().use { response ->
-                    val bodyStr = response.body?.string().orEmpty()
-                    if (!response.isSuccessful) {
-                        throw IOException("Registration failed (${response.code}): $bodyStr")
+                    challengeConsumed = true // Challenge submitted to server (server consumes on receipt)
+
+                    controlClient.newCall(regReq).execute().use { response ->
+                        val bodyStr = response.body?.string().orEmpty()
+                        if (response.isSuccessful) {
+                            val json = JsonParser.parseString(bodyStr).asJsonObject
+                            assignedDeviceId = json.get("deviceId")?.asString
+                            assignedTier = json.get("tier")?.asString ?: "hardware"
+                            assignedExpiresAt = 0L // Permanent lease
+                            hardwareSuccess = true
+                        } else {
+                            // Hardware attestation rejected by backend policy (e.g. software cert, untrusted root, unlocked bootloader)
+                            throw HardwareAttestationRejectedException("Server rejected hardware attestation (${response.code}): $bodyStr")
+                        }
                     }
-                    val json = JsonParser.parseString(bodyStr).asJsonObject
-                    json.get("deviceId")?.asString
-                        ?: throw IllegalStateException("Missing deviceId in registration response: $bodyStr")
+                } catch (e: Exception) {
+                    // Hardware generation or server verification failed; proceed to Tier 2 fallback
+                    hardwareSuccess = false
                 }
 
-                // Step 4: Atomically reset local sequence counter to 0 (server lastSequence = 0)
+                // Step 3: Fallback to Tier 2: Software Protected Registration with PoW
+                if (!hardwareSuccess) {
+                    var currentChallenge = challenge
+                    var currentPowSalt = powSalt
+                    var currentPowDifficulty = powDifficulty
+
+                    // If the challenge was consumed by the server during Step 2, request a fresh challenge
+                    if (challengeConsumed) {
+                        val freshChallengeReq = Request.Builder()
+                            .url("$baseUrl/api/auth/challenge")
+                            .post(gson.toJson(mapOf("platform" to "android")).toRequestBody(jsonMediaType))
+                            .build()
+
+                        controlClient.newCall(freshChallengeReq).execute().use { response ->
+                            val bodyStr = response.body?.string().orEmpty()
+                            if (!response.isSuccessful) {
+                                throw IOException("Fresh challenge request failed (${response.code}): $bodyStr")
+                            }
+                            val json = JsonParser.parseString(bodyStr).asJsonObject
+                            currentChallenge = json.get("challenge")?.asString
+                                ?: throw IllegalStateException("Missing challenge in response: $bodyStr")
+
+                            val powObj = json.getAsJsonObject("pow") ?: json.getAsJsonObject("powInfo")
+                            currentPowSalt = powObj?.get("salt")?.asString ?: ""
+                            currentPowDifficulty = powObj?.get("difficulty")?.asInt ?: 18
+                        }
+                    }
+
+                    // Generate software key pair and export SPKI PEM
+                    KeystoreManager.generateSoftwareKeyPair(context)
+                    val publicKeyPem = KeystoreManager.getSoftwarePublicKeyPem()
+
+                    // Solve PoW puzzle in client background
+                    val powNonce = ProofOfWorkSolver.solveProofOfWork(
+                        challenge = currentChallenge,
+                        salt = currentPowSalt,
+                        difficulty = currentPowDifficulty
+                    )
+
+                    val softwarePayload = gson.toJson(
+                        mapOf(
+                            "challenge" to currentChallenge,
+                            "publicKeyPem" to publicKeyPem,
+                            "powNonce" to powNonce
+                        )
+                    )
+
+                    val regReq = Request.Builder()
+                        .url("$baseUrl/api/auth/register-device")
+                        .post(softwarePayload.toRequestBody(jsonMediaType))
+                        .build()
+
+                    controlClient.newCall(regReq).execute().use { response ->
+                        val bodyStr = response.body?.string().orEmpty()
+                        if (!response.isSuccessful) {
+                            throw IOException("Software tier registration failed (${response.code}): $bodyStr")
+                        }
+                        val json = JsonParser.parseString(bodyStr).asJsonObject
+                        assignedDeviceId = json.get("deviceId")?.asString
+                            ?: throw IllegalStateException("Missing deviceId in registration response: $bodyStr")
+                        assignedTier = json.get("tier")?.asString ?: "software"
+                        // 2-hour rolling lease (prefer exact server expiresAt if returned)
+                        assignedExpiresAt = if (json.has("expiresAt") && !json.get("expiresAt").isJsonNull) {
+                            json.get("expiresAt").asLong
+                        } else {
+                            System.currentTimeMillis() + 2 * 3600 * 1000L
+                        }
+                    }
+                }
+
+                val finalDeviceId = assignedDeviceId
+                    ?: throw IllegalStateException("Failed to obtain deviceId from registration")
+
+                // Step 4: Reset local sequence counter to 0 (server lastSequence = 0)
                 AtomicSequenceGenerator.reset(0L)
 
-                // Step 5: Persist device ID and registered state in non-backup SharedPreferences
-                deviceId = assignedDeviceId
+                // Step 5: Persist device ID, tier, and lease expiration
+                deviceId = finalDeviceId
+                tier = assignedTier
+                leaseExpiresAt = assignedExpiresAt
+                KeystoreManager.activeTier = assignedTier
+
                 val committed = sp.edit()
-                    .putString(KEY_DEVICE_ID, assignedDeviceId)
+                    .putString(KEY_DEVICE_ID, finalDeviceId)
+                    .putString(KEY_TIER, assignedTier)
+                    .putLong(KEY_EXPIRES_AT, assignedExpiresAt)
                     .putBoolean(KEY_REGISTERED, true)
                     .putString(KEY_REGISTERED_URL, baseUrl)
                     .commit()
 
                 if (!committed) {
-                    throw IllegalStateException("Failed to commit device registration state to SharedPreferences")
+                    throw IllegalStateException("Failed to commit device registration state")
                 }
 
-                Result.success(assignedDeviceId)
+                Result.success(finalDeviceId)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -212,6 +352,8 @@ class ApiClient {
         private const val PREFS_NAME = "app_secure_prefs"
         private const val KEY_SERVER_URL = "SERVER_BASE_URL"
         private const val KEY_DEVICE_ID = "DEVICE_ID"
+        private const val KEY_TIER = "device_tier"
+        private const val KEY_EXPIRES_AT = "lease_expires_at"
         private const val KEY_REGISTERED = "registered"
         private const val KEY_REGISTERED_URL = "registered_server_url"
 

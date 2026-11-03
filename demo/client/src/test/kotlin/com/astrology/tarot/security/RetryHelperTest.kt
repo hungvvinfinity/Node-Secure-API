@@ -141,4 +141,59 @@ class RetryHelperTest {
         assertNotEquals("Signatures must be distinct because canonical string contains fresh sequence/timestamp",
             call1.signature, call2.signature)
     }
+
+    @Test
+    fun testSilentRenewalOnLeaseExpired() = runBlocking {
+        val testBaseUrl = "http://localhost:3000"
+        var currentDeviceId = "dev_initial_device"
+        var renewalCount = 0
+
+        val mockServerInterceptor = Interceptor { chain ->
+            val req = chain.request()
+            callCount++
+
+            if (callCount == 1) {
+                // First call fails with 401 DEVICE_LEASE_EXPIRED
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(401)
+                    .message("Unauthorized")
+                    .body("{\"error\":\"DEVICE_LEASE_EXPIRED\",\"message\":\"Rolling lease expired\"}".toResponseBody("application/json".toMediaType()))
+                    .build()
+            } else {
+                // Subsequent call after silent renewal succeeds
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("{\"status\":\"SUCCESS\",\"data\":{\"card\":\"The Sun\"}}".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+        }
+
+        val testHttpClient = OkHttpClient.Builder()
+            .retryOnConnectionFailure(false)
+            .addInterceptor(AttestationSigningInterceptor { currentDeviceId })
+            .addInterceptor(mockServerInterceptor)
+            .build()
+
+        val apiClient = ApiClient(testBaseUrl, testHttpClient, currentDeviceId)
+        apiClient.testRegistrationHandler = {
+            renewalCount++
+            currentDeviceId = "dev_renewed_device_999"
+            Result.success(currentDeviceId)
+        }
+
+        val retryHelper = RetryHelper(apiClient)
+        val result = retryHelper.readTarotWithRetry(
+            question = "Will silent renewal recover?",
+            maxRetries = 3
+        )
+
+        assertTrue("Request must succeed transparently via silent renewal", result.isSuccess)
+        assertEquals("Silent renewal must be triggered exactly once", 1, renewalCount)
+        assertEquals("Server must receive 2 calls (1 expired + 1 recovered)", 2, callCount)
+    }
 }
