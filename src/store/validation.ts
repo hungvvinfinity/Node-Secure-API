@@ -16,6 +16,10 @@ export function validateDeviceRecord(device: DeviceRecord): void {
       (device.signCount !== undefined && !validSignCount(device.signCount)) ||
       (device.platform === 'ios' && (!validSignCount(device.signCount) || typeof device.keyId !== 'string' || !device.keyId)) ||
       !Number.isSafeInteger(device.registeredAt) || device.registeredAt <= 0 ||
+      (device.tier !== undefined && device.tier !== 'hardware' && device.tier !== 'software') ||
+      (device.expiresAt !== undefined && (!Number.isSafeInteger(device.expiresAt) || device.expiresAt <= 0)) ||
+      (device.tier === 'software' && (!Number.isSafeInteger(device.expiresAt) || (device.expiresAt ?? 0) <= 0)) ||
+      (device.platform === 'ios' && device.tier === 'software') ||
       !device.metadata || typeof device.metadata !== 'object' || Array.isArray(device.metadata)) {
     throw new SecurityError('CORRUPTED_DEVICE_RECORD', 500);
   }

@@ -8,13 +8,14 @@ export interface CommitResult {
     | 'KEY_MISMATCH'
     | 'COUNTER_ROLLBACK'
     | 'CORRUPTED_RECORD'
-    | 'MISSING_SIGN_COUNT';
+    | 'MISSING_SIGN_COUNT'
+    | 'LEASE_EXPIRED';
   currentSequence?: string;
 }
 
 export interface SecurityStore {
-  saveChallenge(challenge: string, platform: Platform, ttlSeconds: number): Promise<void>;
-  consumeChallenge(challenge: string): Promise<{ platform: Platform } | null>;
+  saveChallenge(challenge: string, platform: Platform, ttlSeconds: number, salt?: string): Promise<void>;
+  consumeChallenge(challenge: string): Promise<{ platform: Platform; salt?: string } | null>;
   createDeviceNX(device: DeviceRecord): Promise<boolean>;
   getDevice(deviceId: string): Promise<DeviceRecord | null>;
   commitSequence(

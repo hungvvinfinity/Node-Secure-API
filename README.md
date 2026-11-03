@@ -2,7 +2,7 @@
 
 Backend Node.js 24 + TypeScript dựa trên [SECURITY_SOLUTION.md](SECURITY_SOLUTION.md). Android dùng hardware Key Attestation; iOS dùng Apple App Attest. Hai platform triển khai cùng [DeviceSecurityProvider](src/contracts.ts); challenge, canonical request và Redis replay guard dùng chung.
 
-[Kế hoạch và phase gates](IMPLEMENTATION_PLAN.md) · [Kế hoạch scale ngang và chống rủi ro Redis](docs/SCALING_AND_RESILIENCE_PLAN.md) · [Kế hoạch tương thích Android](docs/ANDROID_COMPATIBILITY_PLAN.md) · [Review và kết quả xác minh](docs/REVIEW.md) · [Ma trận kiểm thử](docs/TEST_MATRIX.md) · [Triển khai](docs/DEPLOYMENT.md) · [Giao thức client](docs/CLIENT_PROTOCOL.md) · [Nguồn và quy trình cập nhật](docs/SECURITY_SOURCES.md)
+[Kiến trúc & Quyết định bảo mật](SECURITY_SOLUTION.md) · [Giao thức client](docs/CLIENT_PROTOCOL.md) · [Triển khai & Vận hành](docs/DEPLOYMENT.md) · [Kế hoạch tương thích Android (Chưa implement)](docs/ANDROID_COMPATIBILITY_PLAN.md) · [Canary thiết bị thật (Chưa implement)](docs/CANARY.md) · [Nguồn bảo mật & Cập nhật](docs/SECURITY_SOURCES.md)
 
 ## Chạy toàn bộ project bằng Docker Compose
 
@@ -101,7 +101,7 @@ npm run security:sources
 
 `REDIS_TEST_URL` dành cho Redis test riêng; tests dùng random prefix và không flush database. Đã cấu hình Redis test mà không kết nối được thì test fail; `test:ci` từ chối chạy nếu thiếu biến này. `npm test` không cấu hình Redis chỉ dành cho unit-only local và có thể skip integration; không dùng kết quả đó làm nghiệm thu. `security:sources` cần Git/network, báo drift của commit upstream Android và Google root fingerprints để review; không tự thay trust bundle. CI chạy chính Compose test pipeline, có job kiểm tra drift hàng tuần.
 
-Kết quả Compose: **212 test pass, 0 fail, 0 skip** với Redis thật. [Báo cáo review](docs/REVIEW.md) ghi các lỗi đã sửa, Docker smoke, Redis restart, coverage và giới hạn thực tế. Fixture mật mã và Redis thật không thay cho smoke test Android/iOS thật, kiểm thử proxy production hoặc benchmark tải. [Runbook canary](docs/CANARY.md) có tiêu chí pass/fail và mẫu bằng chứng cho thiết bị thật.
+Kết quả Compose: **212 test pass, 0 fail, 0 skip** với Redis thật. Chi tiết bất biến an ninh, Docker smoke, Redis restart, coverage và các quyết định kiến trúc được tổng hợp tại [SECURITY_SOLUTION.md](SECURITY_SOLUTION.md#10-tổng-hợp-nghiệm-thu--kiểm-định-an-ninh-security-verification-summary). Fixture mật mã và Redis thật không thay cho smoke test Android/iOS thật, kiểm thử proxy production hoặc benchmark tải. [Runbook canary](docs/CANARY.md) có tiêu chí pass/fail và mẫu bằng chứng cho thiết bị thật.
 
 ## Benchmark capacity bằng k6
 
@@ -115,7 +115,7 @@ CAPACITY_API_REPLICAS=4 CAPACITY_REPORT_FILE=capacity-four.json npm run benchmar
 
 Runner build stack benchmark riêng, seed key tổng hợp, phát request ECDSA hợp lệ vào **runtime API thật** bằng k6, tăng tải/dò biên rồi xác nhận 60 giây. Báo cáo tách accepted/rejected/dropped, p95/p99 và CPU/RAM; không tính request lỗi thành throughput thành công. Fixture private key chỉ ở thư mục tạm và được xóa khi cleanup. Không đụng Redis của stack demo.
 
-Đây là Android steady-state với key đã seed, không đo registration hardware, iOS, TLS/proxy hoặc AI business workload. Ngưỡng dùng để dò capacity: p95 <100ms, p99 <250ms, lỗi <1%, dropped=0. `CAPACITY_RATES`, `CAPACITY_STAGE_SECONDS`, `CAPACITY_CONFIRM_SECONDS`, `CAPACITY_VUS` cho phép đổi workload; report ghi cấu hình và không tuyên bố một con số RPS tối đa cho mọi môi trường. Xem [CAPACITY.md](docs/CAPACITY.md) và raw JSON sau mỗi lần chạy.
+Đây là Android steady-state với key đã seed, không đo registration hardware, iOS, TLS/proxy hoặc AI business workload. Ngưỡng dùng để dò capacity: p95 <100ms, p99 <250ms, lỗi <1%, dropped=0. `CAPACITY_RATES`, `CAPACITY_STAGE_SECONDS`, `CAPACITY_CONFIRM_SECONDS`, `CAPACITY_VUS` cho phép đổi workload; report ghi cấu hình và không tuyên bố một con số RPS tối đa cho mọi môi trường. Các số liệu đã xác nhận và ngưỡng trần được tổng hợp tại [SECURITY_SOLUTION.md](SECURITY_SOLUTION.md#9-tổng-hợp-kết-quả-đo-đạc-hiệu-năng--tải-trọng-performance--capacity-baselines).
 
 ## Phạm vi tích hợp
 

@@ -10,6 +10,18 @@ export interface CreateServerOptions {
   controlBodyLimitBytes?: number;
   businessHandler?: (req: IncomingMessage, res: ServerResponse, context: AuthContext) => Promise<void> | void;
   readinessCheck?: () => Promise<boolean>;
+  softwareTarpitDelayMs?: number;
+}
+
+function getClientIp(req: IncomingMessage): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.length > 0) {
+    return forwarded.split(',')[0].trim();
+  }
+  if (Array.isArray(forwarded) && forwarded.length > 0 && typeof forwarded[0] === 'string') {
+    return forwarded[0].split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || '127.0.0.1';
 }
 
 const SECURITY_HEADER_NAMES = new Set([
@@ -28,7 +40,8 @@ function sendJson(res: ServerResponse, statusCode: number, payload: unknown): vo
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'Date': new Date().toUTCString()
   });
   res.end(body);
 }
@@ -149,7 +162,8 @@ export function createServer(options: CreateServerOptions): Server {
     maxBodySizeBytes = 1048576, // 1 MB default
     controlBodyLimitBytes = 65536, // 64 KB default
     businessHandler,
-    readinessCheck
+    readinessCheck,
+    softwareTarpitDelayMs = 3000
   } = options;
 
   const server = http.createServer(async (req, res) => {
@@ -252,7 +266,9 @@ export function createServer(options: CreateServerOptions): Server {
         sendJson(res, 200, {
           status: 'SUCCESS',
           challenge: challengeResult.challenge,
-          expiresAt: challengeResult.expiresAt
+          expiresAt: challengeResult.expiresAt,
+          serverTime: challengeResult.serverTime,
+          ...(challengeResult.pow ? { pow: challengeResult.pow, powInfo: challengeResult.powInfo } : {})
         });
         return;
       }
@@ -289,7 +305,7 @@ export function createServer(options: CreateServerOptions): Server {
           return;
         }
 
-        const { challenge, certificateChain, attestationObject, keyId } = parsed;
+        const { challenge, certificateChain, attestationObject, keyId, publicKeyPem, powNonce } = parsed;
 
         if (!challenge || typeof challenge !== 'string' || !/^[0-9a-fA-F]{64}$/.test(challenge)) {
           sendJson(res, 400, {
@@ -323,24 +339,61 @@ export function createServer(options: CreateServerOptions): Server {
           return;
         }
 
-        if (!certificateChain && !attestationObject) {
+        if (
+          publicKeyPem !== undefined &&
+          (typeof publicKeyPem !== 'string' || !publicKeyPem.trim())
+        ) {
           sendJson(res, 400, {
-            error: 'INVALID_ATTESTATION',
-            message: 'Either certificateChain or attestationObject is required'
+            error: 'INVALID_PUBLIC_KEY',
+            message: 'publicKeyPem must be a non-empty string'
           });
           return;
+        }
+
+        if (powNonce !== undefined && (typeof powNonce !== 'string' || !powNonce.trim())) {
+          sendJson(res, 400, {
+            error: 'INVALID_POW',
+            message: 'powNonce must be a non-empty string'
+          });
+          return;
+        }
+
+        if (!certificateChain && !attestationObject && !publicKeyPem) {
+          sendJson(res, 400, {
+            error: 'INVALID_ATTESTATION',
+            message: 'Either certificateChain, attestationObject, or publicKeyPem is required'
+          });
+          return;
+        }
+
+        // Apply strict IP registration rate limit for software tier registrations
+        const isSoftwareRegistration = publicKeyPem !== undefined || powNonce !== undefined;
+        if (isSoftwareRegistration) {
+          const clientIp = getClientIp(req);
+          const rateLimiter = securityService.getRateLimiter();
+          if (!rateLimiter.checkIpRegistrationLimit(clientIp)) {
+            sendJson(res, 429, {
+              error: 'RATE_LIMIT_EXCEEDED',
+              message: 'Registration rate limit exceeded for this IP'
+            });
+            return;
+          }
         }
 
         const registerResult = await securityService.registerDevice({
           challenge,
           certificateChain: certificateChain as string[] | undefined,
           attestationObject: attestationObject as string | undefined,
-          keyId: typeof keyId === 'string' ? keyId : undefined
+          keyId: typeof keyId === 'string' ? keyId : undefined,
+          publicKeyPem: typeof publicKeyPem === 'string' ? publicKeyPem : undefined,
+          powNonce: typeof powNonce === 'string' ? powNonce : undefined
         });
 
         sendJson(res, 200, {
           status: 'SUCCESS',
           deviceId: registerResult.deviceId,
+          tier: registerResult.device.tier,
+          expiresAt: registerResult.device.expiresAt,
           message: 'Device registered successfully'
         });
         return;
@@ -384,26 +437,53 @@ export function createServer(options: CreateServerOptions): Server {
           rawBody
         });
 
-        // Business handler is ONLY invoked after successful authentication
-        if (businessHandler) {
-          await businessHandler(req, res, authContext);
-          return;
-        }
+        const isSoftware = authContext.device.tier === 'software';
 
-        // Default demo /api/tarot/read response
-        if (pathname === '/api/tarot/read' && method === 'POST') {
-          sendJson(res, 200, {
-            status: 'SUCCESS',
-            data: {
-              card: 'The Star',
-              meaning: 'Hardware security successfully protected your request!'
+        try {
+          // Check IP rate limit for software tier requests
+          if (isSoftware) {
+            const clientIp = getClientIp(req);
+            if (!securityService.getRateLimiter().checkIpRateLimit(clientIp)) {
+              sendJson(res, 429, {
+                error: 'RATE_LIMIT_EXCEEDED',
+                message: 'Rate limit exceeded for this IP'
+              });
+              return;
             }
-          });
-          return;
-        }
+          }
 
-        sendJson(res, 404, { error: 'NOT_FOUND', message: 'Endpoint not found' });
-        return;
+          // Intentional tarpit delay for software tier
+          if (isSoftware && softwareTarpitDelayMs > 0) {
+            await new Promise((resolve) => setTimeout(resolve, softwareTarpitDelayMs));
+          }
+
+          // Business handler is ONLY invoked after successful authentication
+          if (businessHandler) {
+            await businessHandler(req, res, authContext);
+            return;
+          }
+
+          // Default demo /api/tarot/read response
+          if (pathname === '/api/tarot/read' && method === 'POST') {
+            sendJson(res, 200, {
+              status: 'SUCCESS',
+              data: {
+                card: 'The Star',
+                meaning: isSoftware
+                  ? 'Software protection successfully verified your request with PoW defense!'
+                  : 'Hardware security successfully protected your request!'
+              }
+            });
+            return;
+          }
+
+          sendJson(res, 404, { error: 'NOT_FOUND', message: 'Endpoint not found' });
+          return;
+        } finally {
+          if (isSoftware) {
+            securityService.releaseInFlight(authContext.device.deviceId);
+          }
+        }
       }
 
       // 6. Any other unmatched routes

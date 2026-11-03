@@ -8,6 +8,11 @@ export interface AppConfig {
   androidPackage: string;
   androidSignerDigests: string[];
   androidMinimumVersion: bigint;
+  androidAllowSoftwareTier: boolean;
+  powDifficultyBits: number;
+  softwareDeviceTtlSeconds: number;
+  softwareTarpitDelayMs: number;
+  softwareRateLimitRpm: number;
   iosEnabled: boolean;
   iosAppId: string;
   iosEnvironment: 'production' | 'development';
@@ -63,6 +68,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     androidMinimumVersion = BigInt(minimum);
     if (androidMinimumVersion > 9223372036854775807n) throw new Error('MINIMUM_ANDROID_VERSION out of range');
   }
+
+  const androidAllowSoftwareTier = flag('ANDROID_ALLOW_SOFTWARE_TIER', true);
+  const powDifficultyBits = integer('POW_DIFFICULTY_BITS', 18, 1, 256);
+  const softwareDeviceTtlSeconds = integer('SOFTWARE_DEVICE_TTL_SECONDS', 7200, 1, 31536000);
+  const softwareTarpitDelayMs = integer('SOFTWARE_TARPIT_DELAY_MS', 3000, 0, 60000);
+  const softwareRateLimitRpm = integer('SOFTWARE_RATE_LIMIT_RPM', 6, 1, 10000);
+
   let iosAppId = '';
   const iosEnvironment = env.IOS_APP_ATTEST_ENV ?? 'production';
   if (iosEnvironment !== 'production' && iosEnvironment !== 'development') throw new Error('Invalid IOS_APP_ATTEST_ENV');
@@ -88,6 +100,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     redisUrl, redisKeyPrefix,
     bodyLimitBytes: integer('BODY_LIMIT_BYTES', 1_048_576, 1, 10_485_760),
     androidEnabled, androidPackage, androidSignerDigests, androidMinimumVersion,
+    androidAllowSoftwareTier, powDifficultyBits, softwareDeviceTtlSeconds,
+    softwareTarpitDelayMs, softwareRateLimitRpm,
     iosEnabled, iosAppId, iosEnvironment, iosMinimumBundleVersion, iosAllowedValidationCategories,
     iosRequireAppProperties: flag('IOS_REQUIRE_APP_PROPERTIES', false)
   };

@@ -580,6 +580,7 @@ export class IOSSecurityProvider implements DeviceSecurityProvider {
       publicKeyPem: leafPublicKeyPem,
       keyId: calculatedKeyId,
       signCount: 0,
+      tier: 'hardware',
       metadata: {
         platform: 'ios',
         environment: this.environment,

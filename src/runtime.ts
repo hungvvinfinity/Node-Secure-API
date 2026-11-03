@@ -28,7 +28,10 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
         expectedPackageName: config.androidPackage,
         expectedSignerDigests: config.androidSignerDigests,
         minimumVersion: config.androidMinimumVersion,
-        revocationSource: revocations
+        revocationSource: revocations,
+        allowSoftwareTier: config.androidAllowSoftwareTier,
+        powDifficultyBits: config.powDifficultyBits,
+        softwareDeviceTtlSeconds: config.softwareDeviceTtlSeconds
       }));
       refreshTimer = setInterval(() => {
         void revocations.refresh().catch(() => console.error('REVOCATION_REFRESH_FAILED'));
@@ -41,9 +44,19 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
       allowedValidationCategories: config.iosAllowedValidationCategories,
       requireAppProperties: config.iosRequireAppProperties
     }));
-    const securityService = new SecurityService({ store, providers });
-    server = createServer({ securityService, store, maxBodySizeBytes: config.bodyLimitBytes,
-      readinessCheck: async () => !revocations || revocations.isReady() });
+    const securityService = new SecurityService({
+      store,
+      providers,
+      powDifficultyBits: config.powDifficultyBits,
+      softwareRateLimitRpm: config.softwareRateLimitRpm
+    });
+    server = createServer({
+      securityService,
+      store,
+      maxBodySizeBytes: config.bodyLimitBytes,
+      readinessCheck: async () => !revocations || revocations.isReady(),
+      softwareTarpitDelayMs: config.softwareTarpitDelayMs
+    });
     const runningServer = server;
     await new Promise<void>((resolve, reject) => {
       const onError = (error: Error) => reject(error);

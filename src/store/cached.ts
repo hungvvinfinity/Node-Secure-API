@@ -79,12 +79,12 @@ export class CachingSecurityStore implements SecurityStore {
     this.now = options.now ?? (() => Date.now());
   }
 
-  public async saveChallenge(challenge: string, platform: Platform, ttlSeconds: number): Promise<void> {
+  public async saveChallenge(challenge: string, platform: Platform, ttlSeconds: number, salt?: string): Promise<void> {
     // Challenge operations are strictly durable and never cached
-    return this.inner.saveChallenge(challenge, platform, ttlSeconds);
+    return this.inner.saveChallenge(challenge, platform, ttlSeconds, salt);
   }
 
-  public async consumeChallenge(challenge: string): Promise<{ platform: Platform } | null> {
+  public async consumeChallenge(challenge: string): Promise<{ platform: Platform; salt?: string } | null> {
     // Challenge consumption must be atomic and durable
     return this.inner.consumeChallenge(challenge);
   }
@@ -110,7 +110,8 @@ export class CachingSecurityStore implements SecurityStore {
 
     if (entry) {
       const age = currentTime - entry.cachedAt;
-      if (age >= 0 && age < this.ttlMs) {
+      const leaseExpired = entry.record.expiresAt !== undefined && currentTime >= entry.record.expiresAt;
+      if (!leaseExpired && age >= 0 && age < this.ttlMs) {
         this.hitCount++;
         // Promote to most recently used
         this.cache.delete(deviceId);

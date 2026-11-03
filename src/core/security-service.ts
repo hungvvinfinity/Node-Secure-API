@@ -4,11 +4,14 @@ import {
   type DeviceSecurityProvider,
   type Platform,
   type RegistrationInput,
+  type PowInfo,
   SecurityError
 } from '../contracts.js';
 import type { SecurityStore } from '../store/types.js';
 import { buildCanonicalBuffer } from './canonical.js';
 import { computeDeviceId } from './device-id.js';
+import { generatePowChallenge } from './pow.js';
+import { RateLimiter } from './rate-limiter.js';
 
 export interface SecurityServiceOptions {
   store: SecurityStore;
@@ -16,12 +19,20 @@ export interface SecurityServiceOptions {
   maxClockSkewMs?: number;
   challengeTtlSeconds?: number;
   now?: () => number;
+  powDifficultyBits?: number;
+  rateLimiter?: RateLimiter;
+  softwareRateLimitRpm?: number;
+  ipRateLimitRpm?: number;
+  ipRegistrationLimitPerHour?: number;
 }
 
 export interface IssueChallengeResult {
   challenge: string;
   expiresAt: number;
+  serverTime: number;
   platform: Platform;
+  pow?: PowInfo;
+  powInfo?: PowInfo;
 }
 
 export interface RegisterDeviceResult {
@@ -57,6 +68,8 @@ export class SecurityService {
   private readonly maxClockSkewMs: number;
   private readonly challengeTtlSeconds: number;
   private readonly now: () => number;
+  private readonly powDifficultyBits: number;
+  private readonly rateLimiter: RateLimiter;
 
   constructor(options: SecurityServiceOptions) {
     if (options.challengeTtlSeconds !== undefined) {
@@ -74,6 +87,13 @@ export class SecurityService {
     this.maxClockSkewMs = options.maxClockSkewMs ?? 15000;
     this.challengeTtlSeconds = options.challengeTtlSeconds ?? 60;
     this.now = options.now ?? (() => Date.now());
+    this.powDifficultyBits = options.powDifficultyBits ?? 18;
+    this.rateLimiter = options.rateLimiter ?? new RateLimiter({
+      softwareRateLimitRpm: options.softwareRateLimitRpm ?? 6,
+      ipRateLimitRpm: options.ipRateLimitRpm ?? 20,
+      ipRegistrationLimitPerHour: options.ipRegistrationLimitPerHour ?? 5,
+      now: this.now
+    });
 
     if (options.providers) {
       for (const provider of options.providers) {
@@ -94,9 +114,17 @@ export class SecurityService {
     return provider;
   }
 
+  getRateLimiter(): RateLimiter {
+    return this.rateLimiter;
+  }
+
+  releaseInFlight(deviceId: string): void {
+    this.rateLimiter.releaseInFlight(deviceId);
+  }
+
   /**
    * Generates a 32-byte cryptographic random hex challenge,
-   * binds it to a target platform, and stores it with a 60s TTL.
+   * binds it to a target platform, attaches dynamic PoW parameters, and stores it with a 60s TTL.
    */
   async issueChallenge(platform: Platform = 'android'): Promise<IssueChallengeResult> {
     if (platform !== 'android' && platform !== 'ios') {
@@ -107,29 +135,33 @@ export class SecurityService {
     const challenge = crypto.randomBytes(32).toString('hex');
     const now = this.now();
     const expiresAt = now + this.challengeTtlSeconds * 1000;
+    const pow = generatePowChallenge(this.powDifficultyBits);
 
-    await this.store.saveChallenge(challenge, platform, this.challengeTtlSeconds);
+    await this.store.saveChallenge(challenge, platform, this.challengeTtlSeconds, pow.salt);
 
     return {
       challenge,
       expiresAt,
-      platform
+      serverTime: now,
+      platform,
+      pow,
+      powInfo: pow
     };
   }
 
   /**
-   * Registers a hardware-attested device:
+   * Registers a hardware or software-protected device:
    * 1. Atomically consumes single-use challenge.
-   * 2. Verifies cryptographic attestation via platform provider.
+   * 2. Verifies cryptographic attestation / PoW solution via platform provider.
    * 3. Deterministically computes deviceId from platform and SPKI DER base64.
-   * 4. Persists device record atomically with NX (no overwrite) and no TTL.
+   * 4. Persists device record atomically with NX (no overwrite) and appropriate lease TTL.
    */
   async registerDevice(input: RegistrationInput): Promise<RegisterDeviceResult> {
     if (!input.challenge || typeof input.challenge !== 'string' || !/^[0-9a-fA-F]{64}$/.test(input.challenge)) {
       throw new SecurityError('INVALID_CHALLENGE', 400);
     }
 
-    // Atomic consume guarantees single use and retrieves server-bound platform
+    // Atomic consume guarantees single use and retrieves server-bound platform and PoW salt
     const challengeBinding = await this.store.consumeChallenge(input.challenge);
     if (!challengeBinding) {
       throw new SecurityError('INVALID_CHALLENGE', 401);
@@ -139,7 +171,8 @@ export class SecurityService {
 
     // Attestation challenge is the exact UTF-8 bytes of the 64-char hex string
     const challengeContext = {
-      challenge: Buffer.from(input.challenge, 'utf8')
+      challenge: Buffer.from(input.challenge, 'utf8'),
+      salt: challengeBinding.salt
     };
 
     const verified = await provider.verifyRegistration(input, challengeContext);
@@ -153,6 +186,8 @@ export class SecurityService {
       publicKeyPem: verified.publicKeyPem,
       keyId: verified.keyId,
       signCount: verified.signCount,
+      tier: verified.tier ?? 'hardware',
+      expiresAt: verified.expiresAt,
       metadata: verified.metadata ?? {},
       lastSequence: '0',
       registeredAt: this.now()
@@ -174,10 +209,12 @@ export class SecurityService {
    * 1. Validates strict timestamp (integer ms, max 15s clock skew).
    * 2. Validates strict sequence (canonical positive int64, no leading zeros).
    * 3. Looks up device record from persistent store.
-   * 4. Assembles canonical byte buffer over raw body and raw request-target.
-   * 5. Verifies cryptographic signature BEFORE advancing sequence.
-   * 6. Validates iOS signCount requirements strictly.
-   * 7. Atomically commits sequence advance and counter in store.
+   * 4. Verifies rolling device lease (software tier).
+   * 5. Enforces single in-flight concurrency lock & rate limit for software tier.
+   * 6. Assembles canonical byte buffer over raw body and raw request-target.
+   * 7. Verifies cryptographic signature BEFORE advancing sequence.
+   * 8. Validates iOS signCount requirements strictly.
+   * 9. Atomically commits sequence advance and counter in store.
    */
   async authenticateRequest(params: AuthenticateRequestParams): Promise<AuthContext> {
     // 1. Strict timestamp check
@@ -206,15 +243,41 @@ export class SecurityService {
       throw new SecurityError('DEVICE_NOT_REGISTERED', 401);
     }
 
-    // 4. Platform proof requirements
-    if (device.platform === 'android' && !params.signature) {
-      throw new SecurityError('MISSING_SIGNATURE', 401);
-    }
-    if (device.platform === 'ios' && !params.assertion) {
-      throw new SecurityError('MISSING_ASSERTION', 401);
+    // 4. Rolling lease expiration check
+    if (device.expiresAt !== undefined && this.now() >= device.expiresAt) {
+      throw new SecurityError('DEVICE_LEASE_EXPIRED', 401);
     }
 
-    // 5. Assemble canonical UTF-8 buffer over wire-received target and raw body bytes
+    // 5. Software Tier defenses: Rate limiting & Single in-flight concurrency lock
+    const isSoftware = device.tier === 'software';
+    if (isSoftware) {
+      if (!this.rateLimiter.acquireInFlight(device.deviceId)) {
+        throw new SecurityError('CONCURRENT_REQUEST_DISALLOWED', 429);
+      }
+      if (!this.rateLimiter.checkDeviceRateLimit(device.deviceId)) {
+        this.rateLimiter.releaseInFlight(device.deviceId);
+        throw new SecurityError('RATE_LIMIT_EXCEEDED', 429);
+      }
+    }
+
+    // Helper to release in-flight lock if any subsequent authentication step fails
+    const failWithCleanup = (err: unknown): never => {
+      if (isSoftware) {
+        this.rateLimiter.releaseInFlight(device.deviceId);
+      }
+      if (err instanceof SecurityError) throw err;
+      throw new SecurityError('INVALID_SIGNATURE', 401);
+    };
+
+    // 6. Platform proof requirements
+    if (device.platform === 'android' && !params.signature) {
+      failWithCleanup(new SecurityError('MISSING_SIGNATURE', 401));
+    }
+    if (device.platform === 'ios' && !params.assertion) {
+      failWithCleanup(new SecurityError('MISSING_ASSERTION', 401));
+    }
+
+    // 7. Assemble canonical UTF-8 buffer over wire-received target and raw body bytes
     const canonical = buildCanonicalBuffer(
       params.timestamp,
       params.sequence,
@@ -223,9 +286,9 @@ export class SecurityService {
       params.rawBody
     );
 
-    // 6. Verify signature BEFORE atomic sequence advance (prevents burning sequence on invalid signature)
+    // 8. Verify signature BEFORE atomic sequence advance (prevents burning sequence on invalid signature)
     const provider = this.getProvider(device.platform);
-    let verifyResult: { signCount?: number };
+    let verifyResult: { signCount?: number } = {};
     try {
       verifyResult = await provider.verifyRequest(device, {
         canonical,
@@ -233,47 +296,50 @@ export class SecurityService {
         assertion: params.assertion
       });
     } catch (err) {
-      if (err instanceof SecurityError) {
-        throw err;
-      }
-      throw new SecurityError('INVALID_SIGNATURE', 401);
+      failWithCleanup(err);
     }
 
-    // 7. Validate iOS signCount requirement strictly before sequence commit
+    // 9. Validate iOS signCount requirement strictly before sequence commit
     if (device.platform === 'ios') {
-      const newSignCount = verifyResult?.signCount;
+      const newSignCount = verifyResult.signCount;
       if (newSignCount === undefined || newSignCount === null) {
-        throw new SecurityError('MISSING_SIGN_COUNT', 401);
-      }
-      if (!Number.isInteger(newSignCount) || newSignCount < 1 || newSignCount > UINT32_MAX) {
-        throw new SecurityError('INVALID_SIGN_COUNT', 400);
+        failWithCleanup(new SecurityError('MISSING_SIGN_COUNT', 401));
+      } else if (!Number.isInteger(newSignCount) || newSignCount < 1 || newSignCount > UINT32_MAX) {
+        failWithCleanup(new SecurityError('INVALID_SIGN_COUNT', 400));
       }
     }
 
-    // 8. Atomic CAS commit in persistent store
-    const commitResult = await this.store.commitSequence(
-      device.deviceId,
-      device.publicKeyPem,
-      params.sequence,
-      verifyResult?.signCount
-    );
+    // 10. Atomic CAS commit in persistent store
+    let commitResult: Awaited<ReturnType<SecurityStore['commitSequence']>> = { ok: false };
+    try {
+      commitResult = await this.store.commitSequence(
+        device.deviceId,
+        device.publicKeyPem,
+        params.sequence,
+        verifyResult.signCount
+      );
+    } catch (err) {
+      failWithCleanup(err);
+    }
 
     if (!commitResult.ok) {
       switch (commitResult.reason) {
         case 'REPLAY':
-          throw new SecurityError('REPLAY_DETECTED', 401);
+          failWithCleanup(new SecurityError('REPLAY_DETECTED', 401));
         case 'NOT_FOUND':
-          throw new SecurityError('DEVICE_NOT_REGISTERED', 401);
+          failWithCleanup(new SecurityError('DEVICE_NOT_REGISTERED', 401));
         case 'KEY_MISMATCH':
-          throw new SecurityError('INVALID_DEVICE_KEY', 401);
+          failWithCleanup(new SecurityError('INVALID_DEVICE_KEY', 401));
         case 'COUNTER_ROLLBACK':
-          throw new SecurityError('COUNTER_ROLLBACK', 401);
+          failWithCleanup(new SecurityError('COUNTER_ROLLBACK', 401));
         case 'MISSING_SIGN_COUNT':
-          throw new SecurityError('MISSING_SIGN_COUNT', 401);
+          failWithCleanup(new SecurityError('MISSING_SIGN_COUNT', 401));
+        case 'LEASE_EXPIRED':
+          failWithCleanup(new SecurityError('DEVICE_LEASE_EXPIRED', 401));
         case 'CORRUPTED_RECORD':
-          throw new SecurityError('CORRUPTED_DEVICE_RECORD', 500);
+          failWithCleanup(new SecurityError('CORRUPTED_DEVICE_RECORD', 500));
         default:
-          throw new SecurityError('REPLAY_DETECTED', 401);
+          failWithCleanup(new SecurityError('REPLAY_DETECTED', 401));
       }
     }
 

@@ -25,6 +25,7 @@ import 'reflect-metadata';
 import * as crypto from 'node:crypto';
 import * as asn1js from 'asn1js';
 import { getP256Key } from './key-cache.js';
+import { verifyProofOfWork } from '../core/pow.js';
 import {
   DeviceRecord,
   DeviceSecurityProvider,
@@ -51,6 +52,9 @@ export interface AndroidSecurityProviderOptions {
   minimumVersion?: bigint;
   revocationSource: RevocationSource;
   now?: () => number;
+  allowSoftwareTier?: boolean;
+  powDifficultyBits?: number;
+  softwareDeviceTtlSeconds?: number;
 }
 
 // KeyMint Tag Constants
@@ -176,6 +180,9 @@ export class AndroidSecurityProvider implements DeviceSecurityProvider {
   private readonly minimumVersion?: bigint;
   private readonly revocationSource: RevocationSource;
   private readonly now: () => number;
+  private readonly allowSoftwareTier: boolean;
+  private readonly powDifficultyBits: number;
+  private readonly softwareDeviceTtlSeconds: number;
 
   constructor(options: AndroidSecurityProviderOptions) {
     if (!options || typeof options !== 'object') {
@@ -222,24 +229,74 @@ export class AndroidSecurityProvider implements DeviceSecurityProvider {
     this.revocationSource = options.revocationSource;
 
     this.now = options.now ?? Date.now;
+    this.allowSoftwareTier = options.allowSoftwareTier ?? true;
+    this.powDifficultyBits = options.powDifficultyBits ?? 18;
+    this.softwareDeviceTtlSeconds = options.softwareDeviceTtlSeconds ?? 7200;
   }
 
   public async verifyRegistration(
     input: RegistrationInput,
-    context: { challenge: Buffer },
+    context: { challenge: Buffer; salt?: string },
   ): Promise<VerifiedRegistration> {
     if (!input || typeof input !== 'object') {
       throw new SecurityError('INVALID_REGISTRATION_INPUT', 400);
-    }
-
-    if (!Array.isArray(input.certificateChain) || input.certificateChain.length === 0) {
-      throw new SecurityError('MISSING_CERTIFICATE_CHAIN', 400);
     }
 
     if (!context || !Buffer.isBuffer(context.challenge) || context.challenge.length === 0) {
       throw new SecurityError('MISSING_CHALLENGE', 400);
     }
 
+    // Branch 1: Raw EC P-256 public key registration (no certificate chain)
+    if (!input.certificateChain || input.certificateChain.length === 0) {
+      if (!input.publicKeyPem) {
+        throw new SecurityError('MISSING_CERTIFICATE_CHAIN', 400);
+      }
+
+      if (!this.allowSoftwareTier) {
+        throw new SecurityError('HARDWARE_TEE_REQUIRED', 403);
+      }
+
+      if (!input.powNonce || !context.salt) {
+        throw new SecurityError('INVALID_POW', 403);
+      }
+
+      const challengeStr = context.challenge.toString('utf8');
+      if (!verifyProofOfWork(challengeStr, context.salt, input.powNonce, this.powDifficultyBits)) {
+        throw new SecurityError('INVALID_POW', 403);
+      }
+
+      let pubKey: crypto.KeyObject;
+      try {
+        pubKey = crypto.createPublicKey(input.publicKeyPem);
+      } catch {
+        throw new SecurityError('ATTESTED_KEY_NOT_EC', 403);
+      }
+      if (pubKey.asymmetricKeyType !== 'ec') {
+        throw new SecurityError('ATTESTED_KEY_NOT_EC', 403);
+      }
+      const details = pubKey.asymmetricKeyDetails;
+      const curve = details?.namedCurve;
+      if (curve !== 'prime256v1' && curve !== 'secp256r1' && curve !== 'p256') {
+        throw new SecurityError('ATTESTED_KEY_NOT_P256', 403);
+      }
+      const publicKeyPem = exportSpkiPem(pubKey);
+
+      return {
+        publicKeyPem,
+        tier: 'software',
+        expiresAt: this.now() + this.softwareDeviceTtlSeconds * 1000,
+        metadata: {
+          platform: 'android',
+          tier: 'software',
+          attestationSecurityLevel: 'Software',
+          keymasterSecurityLevel: 'Software',
+          deviceLocked: false,
+          verifiedBootState: 'UNVERIFIED',
+        },
+      };
+    }
+
+    // Branch 2: Certificate chain provided
     // 1. Fetch fresh revoked serials. Fails closed if source is stale or unavailable.
     let revokedSerials: Set<string>;
     try {
@@ -279,18 +336,7 @@ export class AndroidSecurityProvider implements DeviceSecurityProvider {
 
     const keyDescription = this.parseKeyDescription(Buffer.from(attExt.value));
 
-    // 5. Attestation Security Level and Keymaster Security Level verification:
-    // Both must be TEE (1) or StrongBox (2). Software (0) is strictly rejected.
-    if (
-      (keyDescription.attestationSecurityLevel !== SEC_LEVEL_TEE &&
-        keyDescription.attestationSecurityLevel !== SEC_LEVEL_STRONGBOX) ||
-      (keyDescription.keymasterSecurityLevel !== SEC_LEVEL_TEE &&
-        keyDescription.keymasterSecurityLevel !== SEC_LEVEL_STRONGBOX)
-    ) {
-      throw new SecurityError('HARDWARE_TEE_REQUIRED', 403);
-    }
-
-    // 6. Attestation Challenge verification: must match byte-for-byte
+    // 5. Attestation Challenge verification: must match byte-for-byte
     if (
       keyDescription.attestationChallenge.length !== context.challenge.length ||
       !crypto.timingSafeEqual(keyDescription.attestationChallenge, context.challenge)
@@ -298,97 +344,188 @@ export class AndroidSecurityProvider implements DeviceSecurityProvider {
       throw new SecurityError('ATTESTATION_CHALLENGE_MISMATCH', 403);
     }
 
-    // 7. Hardware-enforced Key Properties verification
+    // Branch 2A: Hardware VIP verification if no PoW nonce is supplied
+    if (!input.powNonce) {
+      // Attestation Security Level and Keymaster Security Level verification:
+      // Both must be TEE (1) or StrongBox (2). Software (0) is strictly rejected.
+      if (
+        (keyDescription.attestationSecurityLevel !== SEC_LEVEL_TEE &&
+          keyDescription.attestationSecurityLevel !== SEC_LEVEL_STRONGBOX) ||
+        (keyDescription.keymasterSecurityLevel !== SEC_LEVEL_TEE &&
+          keyDescription.keymasterSecurityLevel !== SEC_LEVEL_STRONGBOX)
+      ) {
+        throw new SecurityError('HARDWARE_TEE_REQUIRED', 403);
+      }
+
+      // Hardware-enforced Key Properties verification
+      const hw = keyDescription.hardwareEnforced;
+
+      if (!hw.purposes || !hw.purposes.has(KM_PURPOSE_SIGN)) {
+        throw new SecurityError('HARDWARE_PURPOSE_SIGN_REQUIRED', 403);
+      }
+      if (hw.algorithm !== KM_ALGORITHM_EC) {
+        throw new SecurityError('HARDWARE_ALGORITHM_EC_REQUIRED', 403);
+      }
+      if (hw.keySize !== KM_KEY_SIZE_P256) {
+        throw new SecurityError('HARDWARE_KEY_SIZE_256_REQUIRED', 403);
+      }
+      if (!hw.digests || !hw.digests.has(KM_DIGEST_SHA256)) {
+        throw new SecurityError('HARDWARE_DIGEST_SHA256_REQUIRED', 403);
+      }
+      if (hw.ecCurve !== KM_EC_CURVE_P256) {
+        throw new SecurityError('HARDWARE_CURVE_P256_REQUIRED', 403);
+      }
+      if (hw.origin !== KM_ORIGIN_GENERATED) {
+        throw new SecurityError('HARDWARE_ORIGIN_GENERATED_REQUIRED', 403);
+      }
+
+      // Hardware-enforced Root of Trust verification
+      if (!hw.rootOfTrust) {
+        throw new SecurityError('MISSING_ROOT_OF_TRUST', 403);
+      }
+      if (!hw.rootOfTrust.deviceLocked) {
+        throw new SecurityError('DEVICE_NOT_LOCKED', 403);
+      }
+      if (hw.rootOfTrust.verifiedBootState !== KM_BOOT_STATE_VERIFIED) {
+        throw new SecurityError('BOOT_NOT_VERIFIED', 403);
+      }
+
+      // Attestation Application ID verification (Tag 709)
+      const swAppId = keyDescription.softwareEnforced.attestationApplicationId;
+      const hwAppId = hw.attestationApplicationId;
+
+      if (swAppId && hwAppId) {
+        throw new SecurityError('CONFLICTING_ATTESTATION_APPLICATION_ID', 403);
+      }
+
+      const appId = hwAppId ?? swAppId;
+      if (!appId || appId.packages.length === 0 || appId.signatures.length === 0) {
+        throw new SecurityError('MISSING_ATTESTATION_APPLICATION_ID', 403);
+      }
+
+      const matchingPackage = appId.packages.find((p) => p.name === this.expectedPackageName);
+      if (!matchingPackage) {
+        throw new SecurityError('PACKAGE_NAME_MISMATCH', 403);
+      }
+
+      if (this.minimumVersion !== undefined && matchingPackage.version < this.minimumVersion) {
+        throw new SecurityError('PACKAGE_VERSION_TOO_LOW', 403);
+      }
+
+      const hasValidSigner = appId.signatures.some((sig) => this.expectedSignerDigests.has(sig));
+      if (!hasValidSigner) {
+        throw new SecurityError('SIGNER_DIGEST_MISMATCH', 403);
+      }
+
+      const publicKeyPem = exportSpkiPem(pubKey);
+
+      return {
+        publicKeyPem,
+        tier: 'hardware',
+        metadata: {
+          platform: 'android',
+          tier: 'hardware',
+          attestationSecurityLevel: keyDescription.attestationSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : 'TEE',
+          keymasterSecurityLevel: keyDescription.keymasterSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : 'TEE',
+          attestationVersion: Number(keyDescription.attestationVersion),
+          keymasterVersion: Number(keyDescription.keymasterVersion),
+          packageName: matchingPackage.name,
+          packageVersion: matchingPackage.version.toString(),
+          provisioningMethod: validationResult.provisioningMethod,
+          deviceLocked: hw.rootOfTrust.deviceLocked,
+          verifiedBootState: 'VERIFIED',
+        },
+      };
+    }
+
+    // Branch 2B: Proof of Work nonce supplied (Software Tier or Hardware VIP with PoW)
+    if (!this.allowSoftwareTier) {
+      throw new SecurityError('HARDWARE_TEE_REQUIRED', 403);
+    }
+
+    if (!context.salt) {
+      throw new SecurityError('INVALID_POW', 403);
+    }
+
+    const challengeStr = context.challenge.toString('utf8');
+    if (!verifyProofOfWork(challengeStr, context.salt, input.powNonce, this.powDifficultyBits)) {
+      throw new SecurityError('INVALID_POW', 403);
+    }
+
     const hw = keyDescription.hardwareEnforced;
+    const isHardwareSecLevel = (
+      (keyDescription.attestationSecurityLevel === SEC_LEVEL_TEE ||
+        keyDescription.attestationSecurityLevel === SEC_LEVEL_STRONGBOX) &&
+      (keyDescription.keymasterSecurityLevel === SEC_LEVEL_TEE ||
+        keyDescription.keymasterSecurityLevel === SEC_LEVEL_STRONGBOX)
+    );
+    const hasRootOfTrust = Boolean(hw.rootOfTrust);
+    const isLocked = Boolean(hw.rootOfTrust?.deviceLocked);
+    const isBootVerified = hw.rootOfTrust?.verifiedBootState === KM_BOOT_STATE_VERIFIED;
 
-    // A. Purpose must include SIGN (2)
-    if (!hw.purposes || !hw.purposes.has(KM_PURPOSE_SIGN)) {
-      throw new SecurityError('HARDWARE_PURPOSE_SIGN_REQUIRED', 403);
-    }
+    const hasHwKeyMint = (
+      hw.purposes?.has(KM_PURPOSE_SIGN) &&
+      hw.algorithm === KM_ALGORITHM_EC &&
+      hw.keySize === KM_KEY_SIZE_P256 &&
+      hw.digests?.has(KM_DIGEST_SHA256) &&
+      hw.ecCurve === KM_EC_CURVE_P256 &&
+      hw.origin === KM_ORIGIN_GENERATED
+    );
 
-    // B. Algorithm must be EC (3)
-    if (hw.algorithm !== KM_ALGORITHM_EC) {
-      throw new SecurityError('HARDWARE_ALGORITHM_EC_REQUIRED', 403);
-    }
-
-    // C. Key Size must be 256
-    if (hw.keySize !== KM_KEY_SIZE_P256) {
-      throw new SecurityError('HARDWARE_KEY_SIZE_256_REQUIRED', 403);
-    }
-
-    // D. Digest must include SHA-256 (4)
-    if (!hw.digests || !hw.digests.has(KM_DIGEST_SHA256)) {
-      throw new SecurityError('HARDWARE_DIGEST_SHA256_REQUIRED', 403);
-    }
-
-    // E. EC Curve must be P-256 (1)
-    if (hw.ecCurve !== KM_EC_CURVE_P256) {
-      throw new SecurityError('HARDWARE_CURVE_P256_REQUIRED', 403);
-    }
-
-    // F. Key Origin must be GENERATED (0)
-    if (hw.origin !== KM_ORIGIN_GENERATED) {
-      throw new SecurityError('HARDWARE_ORIGIN_GENERATED_REQUIRED', 403);
-    }
-
-    // 8. Hardware-enforced Root of Trust verification
-    if (!hw.rootOfTrust) {
-      throw new SecurityError('MISSING_ROOT_OF_TRUST', 403);
-    }
-    if (!hw.rootOfTrust.deviceLocked) {
-      throw new SecurityError('DEVICE_NOT_LOCKED', 403);
-    }
-    if (hw.rootOfTrust.verifiedBootState !== KM_BOOT_STATE_VERIFIED) {
-      throw new SecurityError('BOOT_NOT_VERIFIED', 403);
-    }
-
-    // 9. Attestation Application ID verification (Tag 709)
-    // Check for conflicting attestation application IDs across software and hardware lists
     const swAppId = keyDescription.softwareEnforced.attestationApplicationId;
     const hwAppId = hw.attestationApplicationId;
-
-    if (swAppId && hwAppId) {
-      throw new SecurityError('CONFLICTING_ATTESTATION_APPLICATION_ID', 403);
-    }
-
     const appId = hwAppId ?? swAppId;
-    if (!appId || appId.packages.length === 0 || appId.signatures.length === 0) {
-      throw new SecurityError('MISSING_ATTESTATION_APPLICATION_ID', 403);
-    }
+    const matchingPackage = appId?.packages?.find((p) => p.name === this.expectedPackageName);
+    const hasValidSigner = appId?.signatures?.some((sig) => this.expectedSignerDigests.has(sig));
 
-    // A. Expected package name
-    const matchingPackage = appId.packages.find((p) => p.name === this.expectedPackageName);
-    if (!matchingPackage) {
-      throw new SecurityError('PACKAGE_NAME_MISMATCH', 403);
-    }
+    const isHardwareQualified = Boolean(
+      isHardwareSecLevel &&
+      hasRootOfTrust &&
+      isLocked &&
+      isBootVerified &&
+      hasHwKeyMint &&
+      !(swAppId && hwAppId) &&
+      matchingPackage &&
+      (this.minimumVersion === undefined || matchingPackage.version >= this.minimumVersion) &&
+      hasValidSigner
+    );
 
-    // B. Minimum version check
-    if (this.minimumVersion !== undefined && matchingPackage.version < this.minimumVersion) {
-      throw new SecurityError('PACKAGE_VERSION_TOO_LOW', 403);
-    }
-
-    // C. Signer digest check (SHA-256 digest of APK signing certificate)
-    const hasValidSigner = appId.signatures.some((sig) => this.expectedSignerDigests.has(sig));
-    if (!hasValidSigner) {
-      throw new SecurityError('SIGNER_DIGEST_MISMATCH', 403);
-    }
-
-    // 10. Attested EC P-256 SPKI PEM format only
     const publicKeyPem = exportSpkiPem(pubKey);
 
+    if (isHardwareQualified) {
+      return {
+        publicKeyPem,
+        tier: 'hardware',
+        metadata: {
+          platform: 'android',
+          tier: 'hardware',
+          attestationSecurityLevel: keyDescription.attestationSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : 'TEE',
+          keymasterSecurityLevel: keyDescription.keymasterSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : 'TEE',
+          attestationVersion: Number(keyDescription.attestationVersion),
+          keymasterVersion: Number(keyDescription.keymasterVersion),
+          packageName: matchingPackage!.name,
+          packageVersion: matchingPackage!.version.toString(),
+          provisioningMethod: validationResult.provisioningMethod,
+          deviceLocked: hw.rootOfTrust!.deviceLocked,
+          verifiedBootState: 'VERIFIED',
+        },
+      };
+    }
+
+    // Granted Software Tier
     return {
       publicKeyPem,
+      tier: 'software',
+      expiresAt: this.now() + this.softwareDeviceTtlSeconds * 1000,
       metadata: {
         platform: 'android',
-        attestationSecurityLevel: keyDescription.attestationSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : 'TEE',
-        keymasterSecurityLevel: keyDescription.keymasterSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : 'TEE',
+        tier: 'software',
+        attestationSecurityLevel: keyDescription.attestationSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : (keyDescription.attestationSecurityLevel === SEC_LEVEL_TEE ? 'TEE' : 'Software'),
+        keymasterSecurityLevel: keyDescription.keymasterSecurityLevel === SEC_LEVEL_STRONGBOX ? 'StrongBox' : (keyDescription.keymasterSecurityLevel === SEC_LEVEL_TEE ? 'TEE' : 'Software'),
         attestationVersion: Number(keyDescription.attestationVersion),
         keymasterVersion: Number(keyDescription.keymasterVersion),
-        packageName: matchingPackage.name,
-        packageVersion: matchingPackage.version.toString(),
-        provisioningMethod: validationResult.provisioningMethod,
-        deviceLocked: hw.rootOfTrust.deviceLocked,
-        verifiedBootState: 'VERIFIED',
+        deviceLocked: Boolean(hw.rootOfTrust?.deviceLocked),
+        verifiedBootState: hw.rootOfTrust?.verifiedBootState === KM_BOOT_STATE_VERIFIED ? 'VERIFIED' : 'UNVERIFIED',
       },
     };
   }
