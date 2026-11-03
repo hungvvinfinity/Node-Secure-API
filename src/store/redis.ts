@@ -9,6 +9,7 @@ export interface RedisSecurityStoreOptions {
   keyPrefix?: string;
   connectTimeoutMs?: number;
   commandTimeoutMs?: number;
+  now?: () => number;
 }
 
 const CONSUME_CHALLENGE_LUA = `
@@ -24,7 +25,13 @@ end
 const CREATE_DEVICE_NX_LUA = `
 local key = KEYS[1]
 if redis.call('EXISTS', key) == 1 then
-    return 0
+    local exp = redis.call('HGET', key, 'expiresAt')
+    local nowMs = tonumber(ARGV[13] or '0')
+    if exp and exp ~= '' and nowMs > 0 and tonumber(exp) and nowMs >= tonumber(exp) then
+        redis.call('DEL', key)
+    else
+        return 0
+    end
 end
 redis.call('HSET', key,
     'deviceId', ARGV[1],
@@ -35,8 +42,14 @@ redis.call('HSET', key,
     'metadata', ARGV[6],
     'keyId', ARGV[7] or '',
     'signCount', ARGV[8] or '',
-    'receipt', ARGV[9] or ''
+    'receipt', ARGV[9] or '',
+    'tier', ARGV[10] or 'hardware',
+    'expiresAt', ARGV[11] or ''
 )
+local ttl = tonumber(ARGV[12] or '')
+if ttl and ttl > 0 then
+    redis.call('EXPIRE', key, ttl)
+end
 return 1
 `;
 
@@ -45,10 +58,17 @@ local key = KEYS[1]
 local expectedPubKey = ARGV[1]
 local newSeq = ARGV[2]
 local newSignCountStr = ARGV[3]
+local nowMs = tonumber(ARGV[4] or '0')
 
 local exists = redis.call('EXISTS', key)
 if exists == 0 then
     return { -1, 'DEVICE_NOT_FOUND' }
+end
+
+local exp = redis.call('HGET', key, 'expiresAt')
+if exp and exp ~= '' and nowMs > 0 and tonumber(exp) and nowMs >= tonumber(exp) then
+    redis.call('DEL', key)
+    return { -7, 'LEASE_EXPIRED' }
 end
 
 local pubKey = redis.call('HGET', key, 'publicKeyPem')
@@ -114,12 +134,14 @@ export class RedisSecurityStore implements SecurityStore {
   private readonly url: string;
   private readonly connectTimeoutMs: number;
   private readonly commandTimeoutMs: number;
+  private readonly now: () => number;
 
   constructor(options: RedisSecurityStoreOptions = {}) {
     this.prefix = options.keyPrefix ?? 'sec:';
     this.url = options.url ?? process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
     this.connectTimeoutMs = options.connectTimeoutMs ?? 1000;
     this.commandTimeoutMs = options.commandTimeoutMs ?? 1000;
+    this.now = options.now ?? (() => Date.now());
     for (const value of [this.connectTimeoutMs, this.commandTimeoutMs]) {
       if (!Number.isInteger(value) || value < 1 || value > 60000) throw new Error('Invalid Redis timeout');
     }
@@ -193,17 +215,31 @@ export class RedisSecurityStore implements SecurityStore {
   private challengeKey(challenge: string): string { return this.prefix + 'challenge:' + challenge; }
   private deviceKey(deviceId: string): string { return this.prefix + 'device:' + deviceId; }
 
-  async saveChallenge(challenge: string, platform: Platform, ttlSeconds: number): Promise<void> {
+  async saveChallenge(challenge: string, platform: Platform, ttlSeconds: number, salt?: string): Promise<void> {
     if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 3600 ||
         (platform !== 'android' && platform !== 'ios')) throw new SecurityError('INVALID_CHALLENGE', 400);
-    await this.command(c => c.set(this.challengeKey(challenge), platform, { EX: ttlSeconds }));
+    const value = salt ? JSON.stringify({ platform, salt }) : platform;
+    await this.command(c => c.set(this.challengeKey(challenge), value, { EX: ttlSeconds }));
   }
 
-  async consumeChallenge(challenge: string): Promise<{ platform: Platform } | null> {
+  async consumeChallenge(challenge: string): Promise<{ platform: Platform; salt?: string } | null> {
     const result = await this.command(c => c.eval(CONSUME_CHALLENGE_LUA, { keys: [this.challengeKey(challenge)], arguments: [] }));
     if (result === null) return null;
-    if (result !== 'android' && result !== 'ios') throw new SecurityError('CORRUPTED_CHALLENGE', 500);
-    return { platform: result };
+    if (result === 'android' || result === 'ios') return { platform: result };
+    if (typeof result === 'string') {
+      try {
+        const parsed = JSON.parse(result);
+        if (parsed.platform === 'android' || parsed.platform === 'ios') {
+          return { platform: parsed.platform, salt: parsed.salt };
+        }
+      } catch {
+        const parts = result.split(':');
+        if (parts[0] === 'android' || parts[0] === 'ios') {
+          return { platform: parts[0] as Platform, salt: parts[1] };
+        }
+      }
+    }
+    throw new SecurityError('CORRUPTED_CHALLENGE', 500);
   }
 
   async createDeviceNX(device: DeviceRecord): Promise<boolean> {
@@ -212,29 +248,57 @@ export class RedisSecurityStore implements SecurityStore {
     // through Redis and parsing its base64 on every protected API request.
     const { receipt, ...requestMetadata } = device.metadata;
     if (receipt !== undefined && typeof receipt !== 'string') throw new SecurityError('CORRUPTED_DEVICE_RECORD', 500);
+    const ttlSeconds = device.expiresAt ? Math.max(1, Math.ceil((device.expiresAt - this.now()) / 1000)) : 0;
     const result = await this.command(c => c.eval(CREATE_DEVICE_NX_LUA, {
       keys: [this.deviceKey(device.deviceId)],
-      arguments: [device.deviceId, device.platform, device.publicKeyPem, device.lastSequence,
-        String(device.registeredAt), JSON.stringify(requestMetadata), device.keyId ?? '',
-        device.signCount === undefined ? '' : String(device.signCount), receipt ?? '']
+      arguments: [
+        device.deviceId,
+        device.platform,
+        device.publicKeyPem,
+        device.lastSequence,
+        String(device.registeredAt),
+        JSON.stringify(requestMetadata),
+        device.keyId ?? '',
+        device.signCount === undefined ? '' : String(device.signCount),
+        receipt ?? '',
+        device.tier ?? 'hardware',
+        device.expiresAt === undefined ? '' : String(device.expiresAt),
+        ttlSeconds > 0 ? String(ttlSeconds) : '',
+        String(this.now())
+      ]
     }));
     return result === 1;
   }
 
   async getDevice(deviceId: string): Promise<DeviceRecord | null> {
-    const fields = ['deviceId', 'platform', 'publicKeyPem', 'lastSequence', 'registeredAt', 'metadata', 'keyId', 'signCount'];
+    const fields = ['deviceId', 'platform', 'publicKeyPem', 'lastSequence', 'registeredAt', 'metadata', 'keyId', 'signCount', 'tier', 'expiresAt'];
     const values = await this.command(c => c.hmGet(this.deviceKey(deviceId), fields));
     if (values.every(value => value === null)) return null;
     const data: Record<string, string> = Object.fromEntries(fields.map((field, i) => [field, values[i] ?? '']));
+
+    // Check lease expiry
+    if (data.expiresAt && data.expiresAt !== '') {
+      const expMs = Number(data.expiresAt);
+      if (Number.isSafeInteger(expMs) && this.now() >= expMs) {
+        await this.command(c => c.del(this.deviceKey(deviceId)));
+        return null;
+      }
+    }
+
     let metadata: Record<string, unknown>;
     try { metadata = JSON.parse(data.metadata); }
     catch { throw new SecurityError('CORRUPTED_DEVICE_RECORD', 500); }
     const device: DeviceRecord = {
-      deviceId: data.deviceId, platform: data.platform as Platform,
-      publicKeyPem: data.publicKeyPem, lastSequence: data.lastSequence,
-      registeredAt: Number(data.registeredAt), metadata,
+      deviceId: data.deviceId,
+      platform: data.platform as Platform,
+      publicKeyPem: data.publicKeyPem,
+      lastSequence: data.lastSequence,
+      registeredAt: Number(data.registeredAt),
+      metadata,
       keyId: data.keyId || undefined,
-      signCount: data.signCount === '' || data.signCount === undefined ? undefined : Number(data.signCount)
+      signCount: data.signCount === '' || data.signCount === undefined ? undefined : Number(data.signCount),
+      tier: (data.tier as any) || 'hardware',
+      expiresAt: data.expiresAt ? Number(data.expiresAt) : undefined
     };
     if (device.deviceId !== deviceId || (data.signCount && !validSequence(data.signCount, true))) {
       throw new SecurityError('CORRUPTED_DEVICE_RECORD', 500);
@@ -250,7 +314,7 @@ export class RedisSecurityStore implements SecurityStore {
     }
     const raw = await this.command(c => c.eval(COMMIT_SEQUENCE_LUA, {
       keys: [this.deviceKey(deviceId)],
-      arguments: [expectedPublicKeyPem, newSequence, newSignCount === undefined ? '' : String(newSignCount)]
+      arguments: [expectedPublicKeyPem, newSequence, newSignCount === undefined ? '' : String(newSignCount), String(this.now())]
     }));
     if (!Array.isArray(raw) || typeof raw[0] !== 'number') throw new SecurityError('STORE_ERROR', 503);
     const [status, sequence] = raw;
@@ -262,6 +326,7 @@ export class RedisSecurityStore implements SecurityStore {
       case -3: return { ok: false, reason: 'COUNTER_ROLLBACK' };
       case -4: case -5: return { ok: false, reason: 'CORRUPTED_RECORD' };
       case -6: return { ok: false, reason: 'MISSING_SIGN_COUNT' };
+      case -7: return { ok: false, reason: 'LEASE_EXPIRED' };
       default: throw new SecurityError('STORE_ERROR', 503);
     }
   }

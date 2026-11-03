@@ -5,13 +5,13 @@ import { validSequence, validateDeviceRecord } from './validation.js';
 interface ChallengeEntry {
   platform: Platform;
   expiresAt: number;
+  salt?: string;
 }
 
 export interface MemorySecurityStoreOptions {
   now?: () => number;
 }
 
-const SEQUENCE_PATTERN = /^(?:0|[1-9]\d*)$/;
 const UINT32_MAX = 4294967295;
 
 /**
@@ -27,14 +27,14 @@ export class MemorySecurityStore implements SecurityStore {
     this.now = options.now ?? (() => Date.now());
   }
 
-  async saveChallenge(challenge: string, platform: Platform, ttlSeconds: number): Promise<void> {
+  async saveChallenge(challenge: string, platform: Platform, ttlSeconds: number, salt?: string): Promise<void> {
     if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 3600 ||
         (platform !== 'android' && platform !== 'ios')) throw new SecurityError('INVALID_CHALLENGE', 400);
     const expiresAt = this.now() + ttlSeconds * 1000;
-    this.challenges.set(challenge, { platform, expiresAt });
+    this.challenges.set(challenge, { platform, expiresAt, salt });
   }
 
-  async consumeChallenge(challenge: string): Promise<{ platform: Platform } | null> {
+  async consumeChallenge(challenge: string): Promise<{ platform: Platform; salt?: string } | null> {
     const entry = this.challenges.get(challenge);
     if (!entry) {
       return null;
@@ -48,12 +48,18 @@ export class MemorySecurityStore implements SecurityStore {
       return null;
     }
 
-    return { platform: entry.platform };
+    return { platform: entry.platform, salt: entry.salt };
   }
 
   async createDeviceNX(device: DeviceRecord): Promise<boolean> {
-    if (this.devices.has(device.deviceId)) {
-      return false;
+    const existing = this.devices.get(device.deviceId);
+    if (existing) {
+      // If existing device lease has expired, purge and allow renewal
+      if (existing.expiresAt !== undefined && this.now() >= existing.expiresAt) {
+        this.devices.delete(device.deviceId);
+      } else {
+        return false;
+      }
     }
 
     this.validateStoredDevice(device);
@@ -67,6 +73,13 @@ export class MemorySecurityStore implements SecurityStore {
       return null;
     }
     this.validateStoredDevice(device);
+
+    // Enforce lease expiration: fail closed and purge expired lease
+    if (device.expiresAt !== undefined && this.now() >= device.expiresAt) {
+      this.devices.delete(deviceId);
+      return null;
+    }
+
     const result = structuredClone(device);
     delete result.metadata.receipt;
     return result;
@@ -85,6 +98,12 @@ export class MemorySecurityStore implements SecurityStore {
     }
 
     this.validateStoredDevice(device);
+
+    // Fail closed on expired device lease
+    if (device.expiresAt !== undefined && this.now() >= device.expiresAt) {
+      this.devices.delete(deviceId);
+      return { ok: false, reason: 'LEASE_EXPIRED' };
+    }
 
     if (device.publicKeyPem !== expectedPublicKeyPem) {
       return { ok: false, reason: 'KEY_MISMATCH' };

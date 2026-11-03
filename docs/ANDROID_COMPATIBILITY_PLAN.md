@@ -44,7 +44,7 @@ flowchart TD
         
         TierBranch -- "Tier 1: Hardware" --> T1Flow["VIP Fast-Track:\n• 0ms Delay\n• Quota 60 req/phút\n• Khóa lưu vĩnh viễn"]
         
-        TierBranch -- "Tier 2: Software" --> T2Flow["Hàng Rào Phòng Thủ 5 Lớp:\n1. Kiểm tra Rolling Lease (TTL 6h)\n2. Khóa Concurrency (1 request in-flight)\n3. Rate limit chặt (6 req/phút & Per-IP)\n4. Tarpit Delay (Trễ 3.0s)\n5. Daily Quota (5-8 lượt bói/ngày)"]
+        TierBranch -- "Tier 2: Software" --> T2Flow["Hàng Rào Phòng Thủ 5 Lớp:\n1. Kiểm tra Rolling Lease (TTL 2h)\n2. Khóa Concurrency (1 request in-flight)\n3. Rate limit chặt (6 req/phút & Per-IP)\n4. Tarpit Delay (Trễ 3.0s)\n5. Daily Quota (5-8 lượt bói/ngày)"]
     end
     
     T1Flow --> CoreAI["Máy Chủ Nghiệp Vụ AI / Tarot"]
@@ -57,7 +57,7 @@ flowchart TD
 |---|---|---|
 | **Đối tượng thiết bị** | Máy có chip TEE / StrongBox, Google Root CA, bootloader khóa | Máy cũ, chip giá rẻ, unlock bootloader, không GMS |
 | **Yêu cầu khi đăng ký** | Chuỗi chứng chỉ Google Hardware Attestation | Cặp khóa EC P-256 + Lời giải Proof of Work (PoW) |
-| **Thời hạn khóa (Lease TTL)** | **Vĩnh viễn** (gắn chặt với chip phần cứng) | **6 giờ** (sau 6h tự hủy, app tự làm mới ngầm) |
+| **Thời hạn khóa (Lease TTL)** | **Vĩnh viễn** (gắn chặt với chip phần cứng) | **2 giờ** (sau 2h tự hủy, app tự làm mới ngầm) |
 | **Độ trễ xử lý (Latency)** | **Siêu tốc** (0ms delay bổ sung, phản hồi < 50ms) | **Tarpit Delay 3.0s** (chủ động làm chậm kết nối) |
 | **Hạn mức thiết bị (RPM)** | 60 requests / phút | 6 requests / phút (tối đa 1 request in-flight) |
 | **Giới hạn theo dải IP** | Tiêu chuẩn | Nghiêm ngặt (tối đa 5 đăng ký/giờ, 20 req/phút/IP) |
@@ -76,8 +76,8 @@ mindmap
       Người dùng thật: 300ms trong màn hình Splash
       Hacker spam 100k key: 14 giờ CPU 100%
       Server verify: 0.001ms
-    Pillar 2: Rolling Device Lease (TTL 6h)
-      Key software tự hủy sau 6h
+    Pillar 2: Rolling Device Lease (TTL 2h)
+      Key software tự hủy sau 2h
       Không thể tích trữ database 1 triệu key ảo
       Mỗi đợt cào mới phải giải lại PoW
     Pillar 3: Rate Limiting & Concurrency Lock
@@ -105,11 +105,11 @@ mindmap
     Chi phí tính toán tăng vọt, đập tan khả năng tạo hàng loạt key trong chớp mắt.
   * **Server xác thực:** Server chỉ băm đúng 1 lần duy nhất để kiểm tra, thời gian tốn chưa tới **$0.001\,\text{ms}$**.
 
-### Trụ cột 2: Rolling Device Lease (Khóa Tự Hủy Sau 6 Giờ)
-* **Khái niệm**: Thiết bị Software chỉ được cấp phép hoạt động trong vòng **6 giờ** (`expiresAt = now + 21600000`).
+### Trụ cột 2: Rolling Device Lease (Khóa Tự Hủy Sau 2 Giờ)
+* **Khái niệm**: Thiết bị Software chỉ được cấp phép hoạt động trong vòng **2 giờ** (`expiresAt = now + 7200000`).
 * **Hiệu quả ngăn chặn**:
   * Ngăn chặn hoàn toàn việc hacker dùng siêu máy tính "đào" sẵn 1 triệu key ảo lưu vào database để đem bán hoặc dùng dần quanh năm.
-  * Hết 6 giờ, toàn bộ key cũ trở thành rác vô giá trị. Muốn cào tiếp trong các khung giờ sau, hacker lại phải bật máy tính đốt thêm 8.3 giờ CPU.
+  * Hết 2 giờ, toàn bộ key cũ trở thành rác vô giá trị. Muốn cào tiếp trong các khung giờ sau, hacker lại phải bật máy tính đốt thêm 8.3 giờ CPU.
   * Với người dùng thật: SDK trong app tự động làm mới ngầm (silent renewal) khi mở app ở các phiên tiếp theo, không gây gián đoạn.
 
 ### Trụ cột 3: Khóa Concurrency & Rate Limit Đa Chiều
@@ -169,8 +169,8 @@ ANDROID_ALLOW_SOFTWARE_TIER=true
 # Độ khó Proof of Work (số bit 0 dẫn đầu, mặc định: 18)
 POW_DIFFICULTY_BITS=18
 
-# Thời hạn hiệu lực của thiết bị Software (giây, mặc định 6h = 21600)
-SOFTWARE_DEVICE_TTL_SECONDS=21600
+# Thời hạn hiệu lực của thiết bị Software (giây, mặc định 2h = 7200)
+SOFTWARE_DEVICE_TTL_SECONDS=7200
 
 # Tarpit Delay có chủ đích cho Software Tier (ms, mặc định: 3000)
 SOFTWARE_TARPIT_DELAY_MS=3000
@@ -288,7 +288,7 @@ class DeviceSecurityManager(private val context: Context) {
      - Nếu không có chứng chỉ nhưng có `publicKeyPem` hợp lệ $\rightarrow$ kiểm tra PoW $\rightarrow$ cấp `tier: 'software'`.
 4. **Bước 4: Nâng cấp Gateway & Security Service**
    - Bổ sung thông số PoW vào `/api/auth/challenge`.
-   - Bổ sung kiểm tra Lease 6h, khóa Concurrency 1 in-flight request, Rate Limiting và Tarpit Delay 3.0s cho Software Tier.
+   - Bổ sung kiểm tra Lease 2h, khóa Concurrency 1 in-flight request, Rate Limiting và Tarpit Delay 3.0s cho Software Tier.
 5. **Bước 5: Toàn bộ Bộ Test Tự Động**
    - Viết test suite chuyên biệt `test/android-software-tier.test.ts`.
    - Chạy toàn bộ 198 tests hiện có để bảo đảm 100% PASS không có lỗi hồi quy.
