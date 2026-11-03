@@ -47,6 +47,7 @@ class RetryHelperTest {
     @After
     fun tearDown() {
         KeystoreManager.testSigner = null
+        ApiClient.currentAdjustedTime = null
     }
 
     @Test
@@ -195,5 +196,60 @@ class RetryHelperTest {
         assertTrue("Request must succeed transparently via silent renewal", result.isSuccess)
         assertEquals("Silent renewal must be triggered exactly once", 1, renewalCount)
         assertEquals("Server must receive 2 calls (1 expired + 1 recovered)", 2, callCount)
+    }
+
+    @Test
+    fun testSilentRenewalOnExpiredTimestamp() = runBlocking {
+        val testBaseUrl = "http://localhost:3000"
+        var currentDeviceId = "dev_initial_device"
+        var renewalCount = 0
+
+        val mockServerInterceptor = Interceptor { chain ->
+            val req = chain.request()
+            callCount++
+
+            if (callCount == 1) {
+                // First call fails with 401 EXPIRED_TIMESTAMP
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(401)
+                    .message("Unauthorized")
+                    .body("{\"error\":\"EXPIRED_TIMESTAMP\",\"message\":\"Clock skew exceeded 15s\"}".toResponseBody("application/json".toMediaType()))
+                    .build()
+            } else {
+                // Subsequent call after re-sync and silent renewal succeeds
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body("{\"status\":\"SUCCESS\",\"data\":{\"card\":\"The Magician\"}}".toResponseBody("application/json".toMediaType()))
+                    .build()
+            }
+        }
+
+        val testHttpClient = OkHttpClient.Builder()
+            .retryOnConnectionFailure(false)
+            .addInterceptor(AttestationSigningInterceptor { currentDeviceId })
+            .addInterceptor(mockServerInterceptor)
+            .build()
+
+        val apiClient = ApiClient(testBaseUrl, testHttpClient, currentDeviceId)
+        apiClient.testRegistrationHandler = {
+            renewalCount++
+            currentDeviceId = "dev_resynced_device_456"
+            Result.success(currentDeviceId)
+        }
+
+        val retryHelper = RetryHelper(apiClient)
+        val result = retryHelper.readTarotWithRetry(
+            question = "Will clock skew recovery succeed?",
+            maxRetries = 3
+        )
+
+        assertTrue("Request must succeed transparently when clock offset re-syncs after EXPIRED_TIMESTAMP", result.isSuccess)
+        assertEquals("Silent renewal must be triggered exactly once", 1, renewalCount)
+        assertEquals("Server must receive 2 calls (1 expired timestamp + 1 recovered)", 2, callCount)
     }
 }

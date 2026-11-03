@@ -38,7 +38,7 @@
         android:textColor="#FFFFFF"
         android:background="#1E1E2E"
         android:padding="10dp"
-        android:text="http://10.0.2.2:3000"
+        android:text="http://10.40.40.2:3000"
         android:textSize="14sp"
         android:layout_marginBottom="10dp" />
 

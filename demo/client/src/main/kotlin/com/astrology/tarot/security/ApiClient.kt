@@ -43,6 +43,8 @@ class ApiClient {
         private set
     var leaseExpiresAt: Long = 0L
         private set
+    var clockOffsetMs: Long = 0L
+        internal set
 
     // Independent un-intercepted client for registration & control calls (with adequate timeout for PoW/reg)
     private val controlClient: OkHttpClient = OkHttpClient.Builder()
@@ -73,6 +75,8 @@ class ApiClient {
         this.deviceId = sp.getString(KEY_DEVICE_ID, null)
         this.tier = sp.getString(KEY_TIER, "hardware") ?: "hardware"
         this.leaseExpiresAt = sp.getLong(KEY_EXPIRES_AT, 0L)
+        this.clockOffsetMs = sp.getLong(KEY_CLOCK_OFFSET, 0L)
+        currentAdjustedTime = { this.getAdjustedTimestamp() }
 
         // Restore KeystoreManager active tier on app startup
         KeystoreManager.activeTier = this.tier
@@ -105,8 +109,15 @@ class ApiClient {
         this.deviceId = initialDeviceId
         this.tier = initialTier
         this.leaseExpiresAt = 0L
+        this.clockOffsetMs = 0L
+        currentAdjustedTime = { this.getAdjustedTimestamp() }
         this.httpClient = customHttpClient
     }
+
+    /**
+     * Returns current epoch milliseconds adjusted for server clock skew.
+     */
+    fun getAdjustedTimestamp(): Long = System.currentTimeMillis() + clockOffsetMs
 
     /**
      * Checks if the device has a valid registered deviceId and active key.
@@ -164,6 +175,18 @@ class ApiClient {
                     val json = JsonParser.parseString(bodyStr).asJsonObject
                     val ch = json.get("challenge")?.asString
                         ?: throw IllegalStateException("Missing challenge in response: $bodyStr")
+
+                    // Extract and synchronize dynamic server time offset
+                    val serverTime = if (json.has("serverTime") && !json.get("serverTime").isJsonNull) {
+                        json.get("serverTime").asLong
+                    } else if (json.has("expiresAt") && !json.get("expiresAt").isJsonNull) {
+                        json.get("expiresAt").asLong - 60_000L
+                    } else {
+                        System.currentTimeMillis()
+                    }
+                    val offset = serverTime - System.currentTimeMillis()
+                    clockOffsetMs = offset
+                    sp.edit().putLong(KEY_CLOCK_OFFSET, offset).apply()
 
                     // Extract PoW puzzle parameters
                     val powObj = json.getAsJsonObject("pow") ?: json.getAsJsonObject("powInfo")
@@ -238,6 +261,18 @@ class ApiClient {
                             val json = JsonParser.parseString(bodyStr).asJsonObject
                             currentChallenge = json.get("challenge")?.asString
                                 ?: throw IllegalStateException("Missing challenge in response: $bodyStr")
+
+                            // Synchronize dynamic server time offset on fresh challenge
+                            val serverTime = if (json.has("serverTime") && !json.get("serverTime").isJsonNull) {
+                                json.get("serverTime").asLong
+                            } else if (json.has("expiresAt") && !json.get("expiresAt").isJsonNull) {
+                                json.get("expiresAt").asLong - 60_000L
+                            } else {
+                                System.currentTimeMillis()
+                            }
+                            val offset = serverTime - System.currentTimeMillis()
+                            clockOffsetMs = offset
+                            sp.edit().putLong(KEY_CLOCK_OFFSET, offset).apply()
 
                             val powObj = json.getAsJsonObject("pow") ?: json.getAsJsonObject("powInfo")
                             currentPowSalt = powObj?.get("salt")?.asString ?: ""
@@ -348,7 +383,7 @@ class ApiClient {
     }
 
     companion object {
-        const val DEFAULT_BASE_URL = "http://10.0.2.2:3000"
+        const val DEFAULT_BASE_URL = "http://10.40.40.2:3000"
         private const val PREFS_NAME = "app_secure_prefs"
         private const val KEY_SERVER_URL = "SERVER_BASE_URL"
         private const val KEY_DEVICE_ID = "DEVICE_ID"
@@ -356,6 +391,10 @@ class ApiClient {
         private const val KEY_EXPIRES_AT = "lease_expires_at"
         private const val KEY_REGISTERED = "registered"
         private const val KEY_REGISTERED_URL = "registered_server_url"
+        const val KEY_CLOCK_OFFSET = "clock_offset_ms"
+
+        // Singleton time provider allowing Interceptor to fetch adjusted time
+        var currentAdjustedTime: (() -> Long)? = null
 
         private val registrationMutex = Mutex()
 

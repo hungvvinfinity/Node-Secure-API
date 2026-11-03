@@ -98,8 +98,8 @@ class AttestationSigningInterceptor(
             }
             val bodyHash = computeSha256Hex(rawBodyBytes)
 
-            // 3. Acquire sequence & timestamp strictly inside the synchronization lock
-            val timestamp = System.currentTimeMillis().toString()
+            // 3. Acquire sequence & timestamp strictly inside the synchronization lock (adjusted for server clock skew)
+            val timestamp = (ApiClient.currentAdjustedTime?.invoke() ?: System.currentTimeMillis()).toString()
             val sequence = AtomicSequenceGenerator.nextSequenceString()
 
             // 4. Build canonical string

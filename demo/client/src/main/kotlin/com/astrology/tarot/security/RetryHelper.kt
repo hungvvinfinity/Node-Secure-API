@@ -72,14 +72,14 @@ class RetryHelper(private val api: ApiClient) {
                                     JsonParser.parseString(bodyStr).asJsonObject.get("error")?.asString
                                 }.getOrNull()
 
-                                // Transparent Silent Renewal on lease expiration or missing device registration
+                                // Transparent Silent Renewal on lease expiration, missing device registration, or clock skew expired timestamp
                                 if (response.code == 401 &&
-                                    errorCode in setOf("DEVICE_LEASE_EXPIRED", "DEVICE_NOT_REGISTERED", "LEASE_EXPIRED") &&
+                                    errorCode in setOf("DEVICE_LEASE_EXPIRED", "DEVICE_NOT_REGISTERED", "LEASE_EXPIRED", "EXPIRED_TIMESTAMP") &&
                                     attempt < maxRetries - 1
                                 ) {
                                     val renewResult = api.registerDeviceOnce(force = true)
                                     if (renewResult.isSuccess) {
-                                        throw IOException("Lease renewed silently after $errorCode, retrying request...")
+                                        throw IOException("Lease renewed / clock offset re-synced silently after $errorCode, retrying request...")
                                     }
                                 }
 

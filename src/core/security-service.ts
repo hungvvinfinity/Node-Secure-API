@@ -29,6 +29,7 @@ export interface SecurityServiceOptions {
 export interface IssueChallengeResult {
   challenge: string;
   expiresAt: number;
+  serverTime: number;
   platform: Platform;
   pow?: PowInfo;
   powInfo?: PowInfo;
@@ -141,6 +142,7 @@ export class SecurityService {
     return {
       challenge,
       expiresAt,
+      serverTime: now,
       platform,
       pow,
       powInfo: pow

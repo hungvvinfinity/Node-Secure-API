@@ -92,7 +92,9 @@ class MainActivity : AppCompatActivity() {
         // Detect and display hardware security level (StrongBox, TEE, or Software)
         val hwLevel = KeystoreManager.getOrDetectHardwareSecurityLevel(this)
         tvHwLevel.text = "HW: $hwLevel"
-        log("Hệ thống khởi tạo thành công. Phần cứng: $hwLevel | Server: ${initialClient.baseUrl}")
+        val initialOffsetSec = initialClient.clockOffsetMs / 1000
+        val offsetSign = if (initialOffsetSec >= 0) "+${initialOffsetSec}s" else "${initialOffsetSec}s"
+        log("Hệ thống khởi tạo thành công. Phần cứng: $hwLevel | Lệch đồng hồ: $offsetSign | Server: ${initialClient.baseUrl}")
 
         // 1. Button Register
         btnRegister.setOnClickListener {
@@ -108,7 +110,9 @@ class MainActivity : AppCompatActivity() {
                 if (result.isSuccess) {
                     val assignedId = result.getOrNull()
                     val tierName = if (api.tier == "hardware") "Tier 1: Hardware VIP" else "Tier 2: Software Protected (PoW)"
-                    log("✅ Đăng ký thành công! Cấp bậc: $tierName | Device ID: $assignedId")
+                    val offsetSec = api.clockOffsetMs / 1000
+                    val offsetStr = if (offsetSec >= 0) "+${offsetSec}s" else "${offsetSec}s"
+                    log("✅ Đăng ký thành công! Cấp bậc: $tierName | Device ID: $assignedId | Độ lệch đồng hồ với server: $offsetStr")
                     if (api.tier == "software") {
                         log("ℹ️ Software Tier: Kích hoạt Rolling Lease 2h và Tarpit Delay 3.0s chống botnet.")
                     } else {
@@ -171,13 +175,15 @@ class MainActivity : AppCompatActivity() {
                 var tarotResult = doReadTarot()
                 val failure = tarotResult.exceptionOrNull() as? ApiResponseException
 
-                // Auto-recover on lease expiration or device state loss
-                if (failure?.statusCode == 401 && failure.errorCode in setOf("OTP_REQUIRED", "DEVICE_NOT_REGISTERED", "DEVICE_NOT_FOUND", "LEASE_EXPIRED", "DEVICE_LEASE_EXPIRED")) {
-                    log("Server báo [401 ${failure.errorCode}]. Đang thực hiện Silent Renewal ngầm...")
+                // Auto-recover on lease expiration, clock skew, or device state loss
+                if (failure?.statusCode == 401 && failure.errorCode in setOf("OTP_REQUIRED", "DEVICE_NOT_REGISTERED", "DEVICE_NOT_FOUND", "LEASE_EXPIRED", "DEVICE_LEASE_EXPIRED", "EXPIRED_TIMESTAMP")) {
+                    log("Server báo [401 ${failure.errorCode}]. Đang thực hiện Silent Renewal & Time Sync ngầm...")
                     val reReg = api.registerDeviceOnce(force = true)
                     updateHeaderStatus(api)
                     if (reReg.isSuccess) {
-                        log("Silent Renewal thành công! Đang tự động gọi lại request Tarot...")
+                        val offsetSec = api.clockOffsetMs / 1000
+                        val offsetStr = if (offsetSec >= 0) "+${offsetSec}s" else "${offsetSec}s"
+                        log("Silent Renewal & Time Sync thành công (Độ lệch: $offsetStr)! Đang tự động gọi lại request Tarot...")
                         tarotResult = doReadTarot()
                     }
                 } else if (failure?.statusCode == 429 && failure.errorCode == "CONCURRENT_REQUEST_DISALLOWED") {
@@ -286,7 +292,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 log("--- THỬ TẤN CÔNG TIMESTAMP QUÁ HẠN (>15s) ---")
-                val expiredTimestamp = (System.currentTimeMillis() - 30_000L).toString()
+                val expiredTimestamp = (api.getAdjustedTimestamp() - 30_000L).toString()
                 val seq = AtomicSequenceGenerator.nextSequenceString()
                 val payload = gson.toJson(mapOf("question" to "Thử timestamp cũ"))
                 val bodyBytes = payload.toByteArray(Charsets.UTF_8)
@@ -328,6 +334,38 @@ class MainActivity : AppCompatActivity() {
                     log("❌ Kết quả không mong đợi: HTTP $code | Response: $body")
                 }
                 updateHeaderStatus(api)
+            }
+        }
+
+        handleAutoAction(intent)
+    }
+
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleAutoAction(intent)
+    }
+
+    private fun handleAutoAction(intent: android.content.Intent?) {
+        val autoAction = intent?.getStringExtra("AUTO_ACTION") ?: return
+        when (autoAction) {
+            "REGISTER" -> {
+                findViewById<Button>(R.id.btnRegister).postDelayed({
+                    findViewById<Button>(R.id.btnRegister).performClick()
+                }, 500)
+            }
+            "READ_TAROT" -> {
+                findViewById<Button>(R.id.btnReadTarot).postDelayed({
+                    findViewById<Button>(R.id.btnReadTarot).performClick()
+                }, 500)
+            }
+            "TEST_ALL" -> {
+                findViewById<Button>(R.id.btnRegister).postDelayed({
+                    findViewById<Button>(R.id.btnRegister).performClick()
+                    findViewById<Button>(R.id.btnReadTarot).postDelayed({
+                        findViewById<Button>(R.id.btnReadTarot).performClick()
+                    }, 4000)
+                }, 500)
             }
         }
     }
@@ -374,6 +412,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun log(message: String) {
+        android.util.Log.i("TarotApp", message)
         tvConsole.append("\n[${dateFormat.format(Date())}] $message")
         svLog.post { svLog.fullScroll(ScrollView.FOCUS_DOWN) }
     }

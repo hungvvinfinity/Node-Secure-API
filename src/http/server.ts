@@ -40,7 +40,8 @@ function sendJson(res: ServerResponse, statusCode: number, payload: unknown): vo
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store'
+    'Cache-Control': 'no-store',
+    'Date': new Date().toUTCString()
   });
   res.end(body);
 }
@@ -266,6 +267,7 @@ export function createServer(options: CreateServerOptions): Server {
           status: 'SUCCESS',
           challenge: challengeResult.challenge,
           expiresAt: challengeResult.expiresAt,
+          serverTime: challengeResult.serverTime,
           ...(challengeResult.pow ? { pow: challengeResult.pow, powInfo: challengeResult.powInfo } : {})
         });
         return;
