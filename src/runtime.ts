@@ -9,13 +9,23 @@ import { GoogleRevocationSource } from './platform/trust.js';
 import { RedisSecurityStore } from './store/redis.js';
 import { CachingSecurityStore } from './store/cached.js';
 import { IOSSecurityProvider } from './platform/ios.js';
+import { PostgresDeviceStore } from './store/durable/postgres-store.js';
+import { HybridSecurityStore } from './store/hybrid.js';
+import { CheckpointWorker } from './store/checkpoint-worker.js';
+import { createClient } from 'redis';
 
 export interface RunningApplication { server: Server; stop(): Promise<void> }
 
 /** Production composition: fixed trusted roots, real revocation, Redis, and shared security service. */
 export async function startApplication(config: AppConfig): Promise<RunningApplication> {
-  const store = new CachingSecurityStore(new RedisSecurityStore({ url: config.redisUrl, keyPrefix: config.redisKeyPrefix }));
-  const revocations = config.androidEnabled ? new GoogleRevocationSource() : undefined;
+  const redisStore = new RedisSecurityStore({ url: config.redisUrl, keyPrefix: config.redisKeyPrefix });
+  const durable = new PostgresDeviceStore({ connectionString: config.databaseUrl });
+  const workerClient = createClient({url:config.redisUrl, disableOfflineQueue:true});
+  await workerClient.connect();
+  const worker = new CheckpointWorker({client:workerClient as any,durable,keyPrefix:config.redisKeyPrefix,closeClient:true});
+  worker.start();
+  const store = new CachingSecurityStore(new HybridSecurityStore(redisStore,durable,worker));
+  const revocations = config.androidEnabled ? new GoogleRevocationSource({redisUrl:config.redisUrl,redisKeyPrefix:config.redisKeyPrefix}) : undefined;
   let refreshTimer: NodeJS.Timeout | undefined;
   let server: Server | undefined;
   try {
@@ -46,6 +56,7 @@ export async function startApplication(config: AppConfig): Promise<RunningApplic
     }));
     const securityService = new SecurityService({
       store,
+      challengeHmacSecret: config.challengeHmacSecret,
       providers,
       powDifficultyBits: config.powDifficultyBits,
       softwareRateLimitRpm: config.softwareRateLimitRpm

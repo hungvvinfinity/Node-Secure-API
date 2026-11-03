@@ -89,6 +89,10 @@ export class CachingSecurityStore implements SecurityStore {
     return this.inner.consumeChallenge(challenge);
   }
 
+  public async consumeStatelessChallenge(challenge: string, ttlSeconds: number): Promise<boolean> {
+    return this.inner.consumeStatelessChallenge?.(challenge, ttlSeconds) ?? false;
+  }
+
   public async createDeviceNX(device: DeviceRecord): Promise<boolean> {
     // Always attempt durable creation first
     const created = await this.inner.createDeviceNX(device);
@@ -167,6 +171,10 @@ export class CachingSecurityStore implements SecurityStore {
     }
 
     return result;
+  }
+
+  public isQuarantined(timestampMs: number): boolean {
+    return this.inner.isQuarantined?.(timestampMs) ?? false;
   }
 
   public async ping(): Promise<boolean> {

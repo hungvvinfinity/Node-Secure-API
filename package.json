@@ -30,12 +30,14 @@
     "@peculiar/x509": "3.1.0",
     "asn1js": "4.0.0",
     "cbor-x": "1.6.8",
+    "pg": "^8.23.1",
     "pkijs": "4.0.1",
     "redis": "6.3.0",
     "reflect-metadata": "0.2.2"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
+    "@types/pg": "^8.23.1",
     "tsx": "4.23.15",
     "typescript": "7.0.2"
   }

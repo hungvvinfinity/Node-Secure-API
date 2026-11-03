@@ -24,6 +24,7 @@ export interface SecurityServiceOptions {
   softwareRateLimitRpm?: number;
   ipRateLimitRpm?: number;
   ipRegistrationLimitPerHour?: number;
+  challengeHmacSecret?: string;
 }
 
 export interface IssueChallengeResult {
@@ -70,6 +71,7 @@ export class SecurityService {
   private readonly now: () => number;
   private readonly powDifficultyBits: number;
   private readonly rateLimiter: RateLimiter;
+  private readonly challengeHmacSecret: Buffer;
 
   constructor(options: SecurityServiceOptions) {
     if (options.challengeTtlSeconds !== undefined) {
@@ -88,6 +90,9 @@ export class SecurityService {
     this.challengeTtlSeconds = options.challengeTtlSeconds ?? 60;
     this.now = options.now ?? (() => Date.now());
     this.powDifficultyBits = options.powDifficultyBits ?? 18;
+    const secret = options.challengeHmacSecret ?? process.env.CHALLENGE_HMAC_SECRET ?? 'test-only-default-challenge-secret-change-me-0123456789abcdef';
+    if (Buffer.byteLength(secret) < 32) throw new Error('CHALLENGE_HMAC_SECRET must be at least 32 bytes');
+    this.challengeHmacSecret = Buffer.from(secret);
     this.rateLimiter = options.rateLimiter ?? new RateLimiter({
       softwareRateLimitRpm: options.softwareRateLimitRpm ?? 6,
       ipRateLimitRpm: options.ipRateLimitRpm ?? 20,
@@ -123,8 +128,7 @@ export class SecurityService {
   }
 
   /**
-   * Generates a 32-byte cryptographic random hex challenge,
-   * binds it to a target platform, attaches dynamic PoW parameters, and stores it with a 60s TTL.
+   * Generates a stateless signed 32-byte challenge and deterministic PoW salt.
    */
   async issueChallenge(platform: Platform = 'android'): Promise<IssueChallengeResult> {
     if (platform !== 'android' && platform !== 'ios') {
@@ -132,12 +136,16 @@ export class SecurityService {
     }
     this.getProvider(platform);
 
-    const challenge = crypto.randomBytes(32).toString('hex');
     const now = this.now();
+    const payload = Buffer.alloc(17);
+    crypto.randomBytes(12).copy(payload, 0);
+    payload.writeUInt32BE(Math.floor(now / 1000), 12);
+    payload[16] = platform === 'android' ? 1 : 2;
+    const mac = crypto.createHmac('sha256', this.challengeHmacSecret).update(payload).digest().subarray(0, 15);
+    const challenge = Buffer.concat([payload, mac]).toString('hex');
     const expiresAt = now + this.challengeTtlSeconds * 1000;
-    const pow = generatePowChallenge(this.powDifficultyBits);
-
-    await this.store.saveChallenge(challenge, platform, this.challengeTtlSeconds, pow.salt);
+    const salt = crypto.createHmac('sha256', this.challengeHmacSecret).update(Buffer.concat([payload.subarray(0,12), Buffer.from('POW')])).digest().subarray(0,16).toString('hex');
+    const pow = { salt, difficulty: this.powDifficultyBits };
 
     return {
       challenge,
@@ -161,11 +169,17 @@ export class SecurityService {
       throw new SecurityError('INVALID_CHALLENGE', 400);
     }
 
-    // Atomic consume guarantees single use and retrieves server-bound platform and PoW salt
-    const challengeBinding = await this.store.consumeChallenge(input.challenge);
-    if (!challengeBinding) {
-      throw new SecurityError('INVALID_CHALLENGE', 401);
-    }
+    const bytes = Buffer.from(input.challenge, 'hex');
+    const payload=bytes.subarray(0,17), suppliedMac=bytes.subarray(17);
+    const expectedMac=crypto.createHmac('sha256',this.challengeHmacSecret).update(payload).digest().subarray(0,15);
+    if(!crypto.timingSafeEqual(suppliedMac,expectedMac)) throw new SecurityError('INVALID_CHALLENGE',401);
+    const issuedAt=payload.readUInt32BE(12)*1000;
+    if(this.now()<issuedAt || this.now()-issuedAt>this.challengeTtlSeconds*1000) throw new SecurityError('INVALID_CHALLENGE',401);
+    const challengePlatform=payload[16]===1?'android':payload[16]===2?'ios':undefined;
+    if(!challengePlatform) throw new SecurityError('INVALID_CHALLENGE',401);
+    // Redis provides the single-use guarantee without retaining challenge issuance state.
+    if(!this.store.consumeStatelessChallenge || !await this.store.consumeStatelessChallenge(input.challenge,this.challengeTtlSeconds)) throw new SecurityError('INVALID_CHALLENGE',401);
+    const challengeBinding={platform:challengePlatform as Platform,salt:crypto.createHmac('sha256',this.challengeHmacSecret).update(Buffer.concat([payload.subarray(0,12),Buffer.from('POW')])).digest().subarray(0,16).toString('hex')};
 
     const provider = this.getProvider(challengeBinding.platform);
 
@@ -226,6 +240,10 @@ export class SecurityService {
     if (!Number.isSafeInteger(timestampMs) || !Number.isSafeInteger(requestNow) ||
         Math.abs(requestNow - timestampMs) > this.maxClockSkewMs) {
       throw new SecurityError('EXPIRED_TIMESTAMP', 401);
+    }
+
+    if (this.store.isQuarantined?.(timestampMs)) {
+      throw new SecurityError('RETRY_WITH_FRESH_TIMESTAMP', 401);
     }
 
     // 2. Strict sequence check

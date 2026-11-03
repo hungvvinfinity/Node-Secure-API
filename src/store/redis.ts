@@ -10,6 +10,7 @@ export interface RedisSecurityStoreOptions {
   connectTimeoutMs?: number;
   commandTimeoutMs?: number;
   now?: () => number;
+  quarantineWindowMs?: number;
 }
 
 const CONSUME_CHALLENGE_LUA = `
@@ -121,6 +122,10 @@ elseif newSignCountStr and newSignCountStr ~= '' then
     return {-4, 'UNEXPECTED_SIGN_COUNT'}
 end
 
+if KEYS[2] and KEYS[2] ~= '' and ARGV[5] and ARGV[5] ~= '' then
+    redis.call('SADD', KEYS[2], ARGV[5])
+end
+
 redis.call('HSET', key, 'lastSequence', newSeq)
 return { 1, newSeq }
 `;
@@ -135,6 +140,9 @@ export class RedisSecurityStore implements SecurityStore {
   private readonly connectTimeoutMs: number;
   private readonly commandTimeoutMs: number;
   private readonly now: () => number;
+  private readonly quarantineWindowMs: number;
+  private redisBootTimeMs?: number;
+  private quarantineUntilMs?: number;
 
   constructor(options: RedisSecurityStoreOptions = {}) {
     this.prefix = options.keyPrefix ?? 'sec:';
@@ -142,6 +150,7 @@ export class RedisSecurityStore implements SecurityStore {
     this.connectTimeoutMs = options.connectTimeoutMs ?? 1000;
     this.commandTimeoutMs = options.commandTimeoutMs ?? 1000;
     this.now = options.now ?? (() => Date.now());
+    this.quarantineWindowMs = options.quarantineWindowMs ?? 15000;
     for (const value of [this.connectTimeoutMs, this.commandTimeoutMs]) {
       if (!Number.isInteger(value) || value < 1 || value > 60000) throw new Error('Invalid Redis timeout');
     }
@@ -153,7 +162,14 @@ export class RedisSecurityStore implements SecurityStore {
     const client = createClient({
       url: this.url, disableOfflineQueue: true, commandsQueueMaxLength: 4096,
       commandOptions: { timeout: this.commandTimeoutMs },
-      socket: { connectTimeout: this.connectTimeoutMs, reconnectStrategy: false }
+      socket: {
+        connectTimeout: this.connectTimeoutMs,
+        reconnectStrategy: (retries: number) => {
+          if (this.closed) return false;
+          if (retries > 10) return new Error('REDIS_RETRY_EXHAUSTED');
+          return Math.min(50 * (2 ** Math.min(retries, 5)), 5000);
+        }
+      }
     }) as RedisClientType;
     client.on('error', () => { /* Each operation reports a sanitized STORE_ERROR. */ });
     return client;
@@ -191,6 +207,7 @@ export class RedisSecurityStore implements SecurityStore {
       try {
         await this.deadline(client.connect(), this.connectTimeoutMs, client);
         if (this.closed || !client.isReady) throw new SecurityError('STORE_ERROR', 503);
+        await this.checkServerUptime(client);
         return client;
       } catch {
         this.discard(client);
@@ -200,6 +217,42 @@ export class RedisSecurityStore implements SecurityStore {
     this.connecting = attempt;
     try { return await attempt; }
     finally { if (this.connecting === attempt) this.connecting = undefined; }
+  }
+
+  private async checkServerUptime(client: RedisClientType): Promise<void> {
+    try {
+      const info = await client.info('server');
+      const match = info.match(/uptime_in_seconds:(\d+)/);
+      if (match) {
+        const uptime = parseInt(match[1], 10);
+        if (uptime < Math.ceil(this.quarantineWindowMs / 1000)) {
+          this.redisBootTimeMs = this.now() - (uptime * 1000);
+          this.quarantineUntilMs = this.redisBootTimeMs + this.quarantineWindowMs;
+        }
+      }
+    } catch {
+      // Ignore info check if unsupported or restricted
+    }
+  }
+
+  public setQuarantine(bootTimeMs: number, windowMs = 15000): void {
+    this.redisBootTimeMs = bootTimeMs;
+    this.quarantineUntilMs = bootTimeMs + windowMs;
+  }
+
+  public isQuarantined(timestampMs: number): boolean {
+    if (this.quarantineUntilMs !== undefined && this.redisBootTimeMs !== undefined) {
+      const currentTime = this.now();
+      if (currentTime < this.quarantineUntilMs) {
+        if (timestampMs < this.redisBootTimeMs) {
+          return true;
+        }
+      } else {
+        this.quarantineUntilMs = undefined;
+        this.redisBootTimeMs = undefined;
+      }
+    }
+    return false;
   }
 
   private async command<T>(operation: (client: RedisClientType) => Promise<T>): Promise<T> {
@@ -240,6 +293,10 @@ export class RedisSecurityStore implements SecurityStore {
       }
     }
     throw new SecurityError('CORRUPTED_CHALLENGE', 500);
+  }
+
+  async consumeStatelessChallenge(challenge: string, ttlSeconds: number): Promise<boolean> {
+    return await this.command(c => c.set(this.prefix+'consumed:'+challenge,'1',{EX:ttlSeconds,NX:true})) === 'OK';
   }
 
   async createDeviceNX(device: DeviceRecord): Promise<boolean> {
@@ -313,8 +370,8 @@ export class RedisSecurityStore implements SecurityStore {
       return { ok: false, reason: 'COUNTER_ROLLBACK' };
     }
     const raw = await this.command(c => c.eval(COMMIT_SEQUENCE_LUA, {
-      keys: [this.deviceKey(deviceId)],
-      arguments: [expectedPublicKeyPem, newSequence, newSignCount === undefined ? '' : String(newSignCount), String(this.now())]
+      keys: [this.deviceKey(deviceId), this.prefix + 'dirty_devices'],
+      arguments: [expectedPublicKeyPem, newSequence, newSignCount === undefined ? '' : String(newSignCount), String(this.now()), deviceId]
     }));
     if (!Array.isArray(raw) || typeof raw[0] !== 'number') throw new SecurityError('STORE_ERROR', 503);
     const [status, sequence] = raw;

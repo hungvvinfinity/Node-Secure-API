@@ -21,6 +21,7 @@ const UINT32_MAX = 4294967295;
 export class MemorySecurityStore implements SecurityStore {
   private readonly challenges = new Map<string, ChallengeEntry>();
   private readonly devices = new Map<string, DeviceRecord>();
+  private readonly consumedChallenges = new Map<string, number>();
   private readonly now: () => number;
 
   constructor(options: MemorySecurityStoreOptions = {}) {
@@ -49,6 +50,13 @@ export class MemorySecurityStore implements SecurityStore {
     }
 
     return { platform: entry.platform, salt: entry.salt };
+  }
+
+  async consumeStatelessChallenge(challenge: string, ttlSeconds: number): Promise<boolean> {
+    const now=this.now();
+    for(const [key,until] of this.consumedChallenges) if(until<=now) this.consumedChallenges.delete(key);
+    if(this.consumedChallenges.has(challenge)) return false;
+    this.consumedChallenges.set(challenge,now+ttlSeconds*1000); return true;
   }
 
   async createDeviceNX(device: DeviceRecord): Promise<boolean> {
@@ -146,6 +154,7 @@ export class MemorySecurityStore implements SecurityStore {
 
   async close(): Promise<void> {
     this.challenges.clear();
+    this.consumedChallenges.clear();
     this.devices.clear();
   }
 
