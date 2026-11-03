@@ -1,4 +1,4 @@
-import { createPublicKey, webcrypto, X509Certificate } from 'node:crypto';
+import { createPublicKey, type KeyObject, webcrypto, X509Certificate } from 'node:crypto';
 import * as asn1 from 'asn1js';
 import { Certificate, ContentInfo, CryptoEngine, SignedData, setEngine } from 'pkijs';
 import { SecurityError } from '../contracts.js';
@@ -120,7 +120,7 @@ export class AppleReceiptVerifier implements ReceiptVerifier {
       }
       const keyBytes = attributes.get(3);
       if (!keyBytes) throw new SecurityError('RECEIPT_KEY_MISMATCH');
-      let receiptKey;
+      let receiptKey: KeyObject;
       // Apple's field 3 can contain the attested certificate (see Apple's 2026 example).
       try { receiptKey = new X509Certificate(keyBytes).publicKey; }
       catch { receiptKey = createPublicKey({ key: keyBytes, format: 'der', type: 'spki' }); }

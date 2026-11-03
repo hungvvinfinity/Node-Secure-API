@@ -10,7 +10,6 @@ import {
 import type { SecurityStore } from '../store/types.js';
 import { buildCanonicalBuffer } from './canonical.js';
 import { computeDeviceId } from './device-id.js';
-import { generatePowChallenge } from './pow.js';
 import { RateLimiter } from './rate-limiter.js';
 
 export interface SecurityServiceOptions {
@@ -344,20 +343,28 @@ export class SecurityService {
       switch (commitResult.reason) {
         case 'REPLAY':
           failWithCleanup(new SecurityError('REPLAY_DETECTED', 401));
+          break;
         case 'NOT_FOUND':
           failWithCleanup(new SecurityError('DEVICE_NOT_REGISTERED', 401));
+          break;
         case 'KEY_MISMATCH':
           failWithCleanup(new SecurityError('INVALID_DEVICE_KEY', 401));
+          break;
         case 'COUNTER_ROLLBACK':
           failWithCleanup(new SecurityError('COUNTER_ROLLBACK', 401));
+          break;
         case 'MISSING_SIGN_COUNT':
           failWithCleanup(new SecurityError('MISSING_SIGN_COUNT', 401));
+          break;
         case 'LEASE_EXPIRED':
           failWithCleanup(new SecurityError('DEVICE_LEASE_EXPIRED', 401));
+          break;
         case 'CORRUPTED_RECORD':
           failWithCleanup(new SecurityError('CORRUPTED_DEVICE_RECORD', 500));
+          break;
         default:
           failWithCleanup(new SecurityError('REPLAY_DETECTED', 401));
+          break;
       }
     }
 

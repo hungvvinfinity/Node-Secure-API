@@ -58,9 +58,4 @@ export interface DeviceSecurityProvider {
   verifyRequest(device: DeviceRecord, proof: RequestProof): Promise<{ signCount?: number }>;
 }
 
-export class SecurityError extends Error {
-  constructor(public readonly code: string, public readonly status: number = 403) {
-    super(code);
-    this.name = 'SecurityError';
-  }
-}
+export { SecurityError, type SecurityErrorCode, isSecurityError } from './core/errors.js';

@@ -79,9 +79,9 @@ const KM_ORIGIN_GENERATED = 0;
 const KM_BOOT_STATE_VERIFIED = 0;
 
 // Security Levels
-const SEC_LEVEL_SOFTWARE = 0;
-const SEC_LEVEL_TEE = 1;
-const SEC_LEVEL_STRONGBOX = 2;
+export const SEC_LEVEL_SOFTWARE = 0;
+export const SEC_LEVEL_TEE = 1;
+export const SEC_LEVEL_STRONGBOX = 2;
 
 // ASN.1 Parser Bounds
 const ASN1_PARSE_LIMITS = {

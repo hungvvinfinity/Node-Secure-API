@@ -13,15 +13,31 @@ export interface CreateServerOptions {
   softwareTarpitDelayMs?: number;
 }
 
+function isLoopbackOrTrustedProxy(ip: string): boolean {
+  return (
+    ip === '127.0.0.1' ||
+    ip === '::1' ||
+    ip === '::ffff:127.0.0.1' ||
+    process.env.TRUST_PROXY === 'true' ||
+    process.env.TRUST_PROXY === '1'
+  );
+}
+
 function getClientIp(req: IncomingMessage): string {
+  const remoteAddress = req.socket.remoteAddress || '127.0.0.1';
+  if (!isLoopbackOrTrustedProxy(remoteAddress)) {
+    return remoteAddress;
+  }
   const forwarded = req.headers['x-forwarded-for'];
   if (typeof forwarded === 'string' && forwarded.length > 0) {
-    return forwarded.split(',')[0].trim();
+    const first = forwarded.split(',')[0]?.trim();
+    if (first) return first;
   }
   if (Array.isArray(forwarded) && forwarded.length > 0 && typeof forwarded[0] === 'string') {
-    return forwarded[0].split(',')[0].trim();
+    const first = forwarded[0].split(',')[0]?.trim();
+    if (first) return first;
   }
-  return req.socket.remoteAddress || '127.0.0.1';
+  return remoteAddress;
 }
 
 const SECURITY_HEADER_NAMES = new Set([

@@ -413,4 +413,10 @@ export class GoogleRevocationSource implements RevocationSource {
 
     return result.serials;
   }
+
+  public async close(): Promise<void> {
+    if (this.ownsRedis && this.redisClient?.isOpen) {
+      await this.redisClient.quit().catch(() => {});
+    }
+  }
 }
