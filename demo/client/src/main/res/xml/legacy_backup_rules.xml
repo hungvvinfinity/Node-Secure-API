@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Rules for Android 11 and lower: full backup content exclusion -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="app_secure_prefs.xml"/>
+    <exclude domain="sharedpref" path="security_demo_prefs.xml"/>
+</full-backup-content>

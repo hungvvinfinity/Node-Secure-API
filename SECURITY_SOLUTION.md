@@ -261,4 +261,115 @@ flowchart LR
 | **Bảo toàn toàn vẹn byte** | **Raw Body SHA-256** | Chặn đứng mọi kỹ thuật sửa đổi payload hay biến đổi khoảng trắng. |
 
 > **Kết luận cuối cùng:**  
-> Hệ thống phòng thủ được thiết kế khép kín từ phần cứng con chip (TEE/StrongBox), bảo chứng bởi tập đoàn Google (Hardware Root CA), định danh chính xác gói ứng dụng (Tag 709), kiểm tra số thứ tự 64-bit chống Replay và toàn vẹn gói tin nguyên bản trên đường truyền. Đây là giải pháp bảo mật cấp doanh nghiệp, vừa ngăn chặn 100% botnet từ PC vừa mang lại trải nghiệm mượt mà nhất cho người dùng thật.
+> Hệ thống phòng thủ được thiết kế khép kín từ phần cứng con chip (TEE/StrongBox), bảo chứng bởi tập đoàn Google (Hardware Root CA) & Apple (App Attest), định danh chính xác gói ứng dụng (Tag 709 / RP ID), kiểm tra số thứ tự 64-bit chống Replay và toàn vẹn gói tin nguyên bản trên đường truyền. Đây là giải pháp bảo mật cấp doanh nghiệp, vừa ngăn chặn 100% botnet từ PC vừa mang lại trải nghiệm mượt mà nhất cho người dùng thật.
+
+---
+
+## 8. Các Quyết Định Kiến Trúc Cốt Lõi (Architectural Decision Records - ADRs)
+
+Dưới đây là các quyết định kỹ thuật nền tảng đã được chính thức chuẩn hóa và đóng băng (frozen invariants) trong mã nguồn `Node-Secure-API`:
+
+### ADR 1: Xác thực Chuỗi Chứng Chỉ & Nguồn Gốc Root CA (Trust Anchors)
+* **Google Root CA (Android)**:
+  - Hỗ trợ đồng thời cả Google RSA Root và EC Root mới 2026.
+  - Đối chiếu tin cậy dựa trên Subject Public Key Info (**SPKI**) kết hợp chữ ký hợp lệ thay vì pin cố định toàn bộ chuỗi nhị phân DER, giúp chấp nhận các root reissue với cùng cặp khóa.
+  - Bắt buộc kiểm tra cấp độ bảo mật cả Keymaster lẫn Attestation phải thuộc TEE (1) hoặc StrongBox (2).
+* **Apple App Attest (iOS)**:
+  - Tách biệt hoàn toàn chứng thực App Attest với receipt thông thường: Chứng chỉ App Attest kết nối về Apple App Attestation Root CA; Receipt CMS được xác minh riêng bằng Apple Root CA - G3 với signer mang OID marker `1.2.840.113635.100.12.15`.
+  - Nghiêm ngặt môi trường: Chỉ chấp nhận AAGUID `appattestdevelop` ở môi trường dev/staging; production bắt buộc production AAGUID. Cấm client gửi header tự khai để đổi môi trường xác thực.
+* **Quy chuẩn ASN.1 & CBOR**:
+  - Giới hạn kích thước, độ sâu lồng ghép (depth bounds) và số lượng node để triệt tiêu tấn công DoS/ReDoS bằng chứng chỉ độc hại; từ chối dứt khoát các critical extension không xác định.
+
+### ADR 2: Định Chuẩn Dữ Liệu Wire Format (Canonical Request Integrity)
+* Mọi request nghiệp vụ đều phải được chuẩn hóa thành chuỗi UTF-8 không có ký tự newline cuối:
+  $$\text{canonical} = \text{timestamp} \mathbin{\Vert} \text{":"} \mathbin{\Vert} \text{sequence} \mathbin{\Vert} \text{":"} \mathbin{\Vert} \text{METHOD} \mathbin{\Vert} \text{":"} \mathbin{\Vert} \text{requestTarget} \mathbin{\Vert} \text{":"} \mathbin{\Vert} \text{bodySha256}$$
+* **requestTarget**: Bao gồm cả query string nguyên bản, không được URL-decode, không sắp xếp lại (no-reorder), không chuẩn hóa khoảng trắng hay dấu slash.
+* **bodySha256**: Giá trị SHA-256 viết thường (lowercase hex) tính trên chuỗi byte thô nguyên bản (`rawBody`). Body rỗng sử dụng hash của mảng rỗng (`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`).
+* Từ chối HTTP content encoding nén (`gzip`, `br`) trên các route bảo mật để tránh rủi ro biến đổi byte do quá trình giải nén của proxy.
+
+### ADR 3: Quản Lý Số Thứ Tự Đơn Điệu 64-bit (Strict Monotonic Sequence)
+* **Xử lý số nguyên 64-bit**:
+  - Client gửi sequence dưới dạng chuỗi số thập phân trong header `X-Sequence` (miền giá trị từ `1` đến `9223372036854775807`). Cấm số âm, số thực và số có số 0 dẫn đầu (leading zeros).
+  - Node.js xử lý bằng kiểu `BigInt`.
+* **Thẩm định nguyên tử trong Redis Lua**:
+  - Script Lua thực hiện so sánh chuỗi số canonical decimal (đối chiếu độ dài chuỗi trước, sau đó so sánh từ điển lexicographic), **tuyệt đối không dùng `tonumber()` trong Lua 5.1** để bảo toàn 100% độ chính xác cho các giá trị vượt ngưỡng $2^{53}$.
+  - Commit đồng thời cả `lastSequence` của ứng dụng và `counter` của Apple App Attest trong cùng 1 transaction nguyên tử.
+  - Chỉ chấp nhận $1$ request chiến thắng duy nhất khi có hàng chục request đồng thời cùng số thứ tự.
+
+### ADR 4: Độ Tươi (Freshness) & Chống Replay
+* **Dung sai thời gian (Timestamp Tolerance)**:
+  - Sai số cho phép tối đa giữa timestamp client và đồng hồ máy chủ là $\pm 15$ giây (`TIMESTAMP_TOLERANCE_MS = 15_000`). Bất kỳ độ lệch nào vượt ngưỡng đều bị từ chối ngay lập tức (`EXPIRED_TIMESTAMP`).
+* **Challenge Nonce ngẫu nhiên**:
+  - Cấp mã ngẫu nhiên 32 byte (64 ký tự hex) với TTL 60 giây.
+  - Sử dụng lệnh `GETDEL` nguyên tử trong Redis để đảm bảo challenge chỉ được tiêu thụ đúng một lần duy nhất (Single-Use).
+
+### ADR 5: Nguyên Tắc "Fail-Closed" & Không Mock Trong Production
+* Không hỗ trợ bất kỳ header, cờ môi trường hay switch từ client (`X-Test-Mode`, `ALLOW_DEV_ROOT_CA`) nào để nới lỏng chính sách CA trong entrypoint production. Mock/Synthetic test chỉ được đưa vào thông qua Constructor Injection trong bộ test suite độc lập.
+* **Thu hồi chứng chỉ (Revocation CRL)**:
+  - Kiểm tra serial number của mọi chứng chỉ trong chain qua Google Revocation List.
+  - Tôn trọng HTTP `max-age`, tính toán độ tươi hữu hạn. Khi snapshot CRL bị cũ quá hạn (stale) hoặc tải lỗi, server lập tức chuyển sang chế độ fail-closed và từ chối đăng ký mới.
+* **Redis Store Fail-Closed**:
+  - Bắt buộc Redis cho runtime production; không tự động fallback sang `MemoryStore` khi mất kết nối Redis để ngăn chặn tấn công mở lại replay window.
+
+### ADR 6: Chiến Lược Thử Lại (Retry) & Tính Bất Biến Nghiệp Vụ (Idempotency)
+* Khi gặp sự cố mạng hoặc timeout, client **không được phát lại gói tin cũ**. Mỗi lần retry bắt buộc phải rút số `X-Sequence` mới, cập nhật `X-Timestamp` mới và thực hiện ký số lại.
+* Tính không trùng lặp nghiệp vụ (ví dụ: không trừ tiền 2 lần, không xem bài 2 lần) được đảm bảo bằng `Idempotency-Key` nằm trong phần thân payload đã được ký và được kiểm soát bởi transaction/database của máy chủ nghiệp vụ.
+
+### ADR 7: Tính Bền Vững Của Thiết Bị & Anti-Overwrite
+* Định danh `deviceId` được server suy ra trực tiếp từ băm SHA-256 của Subject Public Key Info (SPKI).
+* Nghiêm cấm ghi đè (Anti-Overwrite / NX): Nếu một thiết bị gửi lại yêu cầu đăng ký cho cùng một public key hoặc cùng deviceId, server từ chối ghi đè hoặc reset counter để chống tấn công replay lịch sử.
+* Thiết bị phần cứng đã đăng ký không thiết lập TTL tự hủy trong Redis để tránh việc hết hạn làm mở lại nguy cơ replay. Việc thu hồi thiết bị thực hiện qua quy trình quản trị rekey riêng.
+
+---
+
+## 9. Tổng Hợp Kết Quả Đo Đạc Hiệu Năng & Tải Trọng (Performance & Capacity Baselines)
+
+Kết quả đo đạc thực nghiệm trên môi trường máy chủ chuẩn (AMD Ryzen 7 8845H, 16 logical CPUs, Redis container cấu hình bền vững **AOF + appendfsync always**, noeviction):
+
+### 9.1 Đường Request & Tối Ưu Cache Cục Bộ
+* **Tối ưu hóa**:
+  - Chứng thực phần cứng X.509/ASN.1 chỉ diễn ra 1 lần duy nhất lúc đăng ký (`/api/auth/register-device`).
+  - Đường request nghiệp vụ (`/api/tarot/read`) sử dụng bộ nhớ đệm LRU lưu trữ `KeyObject` EC P-256 (tối đa 4.096 entries) và Identity thiết bị (TTL 5 phút).
+  - Xác thực chữ ký ECDSA và commit số thứ tự diễn ra trong **1 round-trip duy nhất tới Redis** qua Lua script.
+* **Độ trễ xử lý**:
+  - Đọc Redis truyền thống: ~2.076 req/s, p50 = 7,25ms, p95 = 11,18ms.
+  - Hot Identity Cache: **~2.691 req/s**, p50 = 5,72ms, p95 = 7,72ms.
+
+### 9.2 Khả Năng Chịu Tải Đo Bằng Grafana k6 (Docker Runtime API Thật)
+Đo tải độc lập với k6 executor `constant-arrival-rate`, mỗi request ký số ECDSA DER SHA-256 thật và thẩm định qua Redis Lua thật trong suốt 60 giây:
+
+| Cấu hình Runtime | Mức tải xác nhận (60s) | Tổng Request Thành Công | Tỷ lệ Lỗi HTTP | Dropped Iterations | Độ trễ p95 HTTP | Độ trễ p99 HTTP |
+|---|---:|---:|---:|---:|---:|---:|
+| **1 API Process** | **4.000 RPS** | 240.000 | **0%** | **0** | **6,09 ms** | 12,28 ms |
+| **4 API Replicas** | **9.000 RPS** | 540.001 | **0%** | **0** | **5,70 ms** | 8,92 ms |
+
+> [!TIP]
+> Ngưỡng trần bão hòa quan sát được khi ép tải tối đa là ~5.500 req/s cho 1 process và ~12.000 req/s cho cụm 4 replicas. Cụm API mở rộng tuyến tính rất tốt và bottleneck CPU xuất hiện ở Node.js trước khi Redis bị quá tải.
+
+---
+
+## 10. Tổng Hợp Nghiệm Thu & Kiểm Định An Ninh (Security Verification Summary)
+
+* **Trạng thái kiểm thử toàn diện**:
+  - **212 / 212 Tests PASSED (100%)**, bao gồm 45 test suites trên 16 test files độc lập.
+  - Phạm vi kiểm định bao phủ: Wire format canonical, chống Replay với BigInt > $2^{53}$, chống biến đổi 1-bit whitespace, kiểm thử tấn công đồng thời (20 race conditions cùng tiêu thụ 1 challenge / cùng 1 sequence), kiểm tra Apple App Attest/Receipt CMS, và kiểm định CBOR an toàn.
+* **Bảo đảm Persistence khi Restart Container Redis**:
+  - Script kiểm tra `npm run test:redis-restart` khởi động lại container Redis thật có dữ liệu sequence > $2^{53}$ và counter iOS: Dữ liệu hoàn toàn nguyên vẹn sau khi restart, các gói tin cũ tiếp tục bị chặn replay, số tiếp theo được chấp nhận bình thường.
+* **Phát hiện Drift Upstream Tự Động**:
+  - Script `npm run security:sources` kiểm tra định kỳ fingerprint của Google Root CA và upstream commit `android/keyattestation` với snapshot đã được thẩm định trong `docs/upstream-snapshot.json`.
+
+---
+
+## 11. Mục Lục Tài Liệu Tham Chiếu Dự Án (Documentation Index)
+
+Hệ thống tài liệu của dự án được tinh gọn thành các chuyên đề chuyên biệt sau:
+
+### 11.1 Tài Liệu Đang Triển Khai / Chưa Implement (Future Proposals & Runbooks)
+* [docs/ANDROID_COMPATIBILITY_PLAN.md](docs/ANDROID_COMPATIBILITY_PLAN.md): **Kế hoạch tương thích 100% Android & Cơ chế phòng vệ bất đối xứng** — Thiết kế Dual-Tier (Tier 1 Hardware VIP vs Tier 2 Software Protected với Dynamic Proof of Work PoW, 3.0s Intentional Tarpit, 6h Rolling Device Lease và giới hạn 6 req/phút).
+* [docs/CANARY.md](docs/CANARY.md): **Runbook Canary trên Thiết Bị Thật** — Quy trình nghiệm thu trên phần cứng điện thoại Android/iOS thực tế khi có thông tin ký ứng dụng chính thức (kèm mẫu báo cáo [docs/canary-evidence.template.json](docs/canary-evidence.template.json)).
+
+### 11.2 Tài Liệu Vận Hành & Tích Hợp Cốt Lõi (Core Specifications)
+* [docs/CLIENT_PROTOCOL.md](docs/CLIENT_PROTOCOL.md): **Đặc tả Giao Thức Client Mobile** — Hướng dẫn chi tiết cho lập trình viên Android (Kotlin / OkHttp) và iOS (Swift / DCAppAttestService) tạo chuỗi canonical, đúc khóa trong TEE/SE, đóng dấu chữ ký và xử lý retry.
+* [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): **Hướng Dẫn Triển Khai & Vận Hành** — Cấu hình Reverse Proxy TLS bảo toàn byte, cấu hình Redis bền vững (AOF, noeviction, appendfsync), đồng bộ NTP, giám sát readiness và Docker container.
+* [docs/SECURITY_SOURCES.md](docs/SECURITY_SOURCES.md): **Nguồn Chứng Chỉ & Căn Cứ Bảo Mật** — Danh mục các tài liệu và endpoint chính thức từ Google / Apple và quy trình đối chiếu drift định kỳ.
+* [README.md](README.md): **Hướng Dẫn Khởi Động Nhanh** — Chạy cụm Gateway bằng Docker Compose (`compose.yaml`) hoặc chạy môi trường dev cục bộ.
