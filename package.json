@@ -9,7 +9,15 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
+    "lint": "biome lint src test",
+    "lint:fix": "biome check --write src test",
+    "format": "biome format --write src test",
+    "check": "npm run typecheck && npm run lint && npm test",
     "test": "tsx --test test/*.test.ts",
+    "test:fast": "tsx --test test/config.test.ts test/canonical-request.test.ts test/cbor-security.test.ts test/key-cache.test.ts test/trust-cache.test.ts",
+    "test:android": "tsx --test test/android*.test.ts",
+    "test:ios": "tsx --test test/ios*.test.ts",
+    "test:http": "tsx --test test/http-server.test.ts",
     "test:coverage": "tsx --test --experimental-test-coverage --test-coverage-include='src/**/*.ts' test/*.test.ts",
     "test:ci": "node scripts/require-test-redis.mjs && npm run test:coverage",
     "test:docker": "node scripts/test-compose.mjs",
@@ -30,12 +38,16 @@
     "@peculiar/x509": "3.1.0",
     "asn1js": "4.0.0",
     "cbor-x": "1.6.8",
+    "pg": "^8.23.1",
     "pkijs": "4.0.1",
     "redis": "6.3.0",
-    "reflect-metadata": "0.2.2"
+    "reflect-metadata": "0.2.2",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.4",
     "@types/node": "^24.19.2",
+    "@types/pg": "^8.23.1",
     "tsx": "4.23.15",
     "typescript": "7.0.2"
   }

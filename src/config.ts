@@ -3,6 +3,8 @@ export interface AppConfig {
   port: number;
   redisUrl: string;
   redisKeyPrefix: string;
+  databaseUrl: string;
+  challengeHmacSecret: string;
   bodyLimitBytes: number;
   androidEnabled: boolean;
   androidPackage: string;
@@ -49,6 +51,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (!['redis:', 'rediss:'].includes(parsedRedisUrl.protocol)) throw new Error('REDIS_URL must use redis or rediss');
   const redisKeyPrefix = env.REDIS_KEY_PREFIX?.trim() || 'secure-api:';
   if (!/^[a-zA-Z0-9:_-]{1,64}$/.test(redisKeyPrefix)) throw new Error('Invalid REDIS_KEY_PREFIX');
+  const databaseUrl = env.DATABASE_URL?.trim() || 'postgres://postgres:securepass@127.0.0.1:5432/secure_api';
+  const challengeHmacSecret = env.CHALLENGE_HMAC_SECRET?.trim() || 'test-only-default-challenge-secret-change-me-0123456789abcdef';
+  if (Buffer.byteLength(challengeHmacSecret) < 32) throw new Error('CHALLENGE_HMAC_SECRET must be at least 32 bytes');
   const androidEnabled = flag('ANDROID_ENABLED', true);
   const iosEnabled = flag('IOS_ENABLED', Boolean(env.IOS_APP_ID?.trim()));
   if (!androidEnabled && !iosEnabled) throw new Error('At least one security provider must be configured');
@@ -97,7 +102,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   return {
     host: env.HOST?.trim() || '0.0.0.0',
     port: integer('PORT', 3000, 1, 65535),
-    redisUrl, redisKeyPrefix,
+    redisUrl, redisKeyPrefix, databaseUrl, challengeHmacSecret,
     bodyLimitBytes: integer('BODY_LIMIT_BYTES', 1_048_576, 1, 10_485_760),
     androidEnabled, androidPackage, androidSignerDigests, androidMinimumVersion,
     androidAllowSoftwareTier, powDifficultyBits, softwareDeviceTtlSeconds,

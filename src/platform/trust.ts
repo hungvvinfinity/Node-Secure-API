@@ -14,6 +14,8 @@
 
 import { X509Certificate as NodeX509Certificate } from 'node:crypto';
 import { SecurityError } from '../contracts.js';
+import { createClient, type RedisClientType } from 'redis';
+import crypto from 'node:crypto';
 
 export const GOOGLE_ATTESTATION_ROOTS_URL = 'https://android.googleapis.com/attestation/root';
 export const GOOGLE_ATTESTATION_STATUS_URL = 'https://android.googleapis.com/attestation/status';
@@ -268,6 +270,9 @@ export interface GoogleRevocationSourceOptions {
   maxAgeMs?: number;
   fetchFn?: typeof fetch;
   now?: () => number;
+  redisUrl?: string;
+  redisKeyPrefix?: string;
+  redisClient?: RedisClientType;
 }
 
 interface RevocationSnapshot {
@@ -287,6 +292,9 @@ export class GoogleRevocationSource implements RevocationSource {
   private readonly configuredMaxAgeMs: number;
   private readonly fetchFn: typeof fetch;
   private readonly now: () => number;
+  private readonly redisClient?: RedisClientType;
+  private readonly ownsRedis: boolean;
+  private readonly redisPrefix: string;
 
   private snapshot: RevocationSnapshot | null = null;
   private inFlightRefresh: Promise<Set<string>> | null = null;
@@ -308,6 +316,9 @@ export class GoogleRevocationSource implements RevocationSource {
 
     this.fetchFn = options.fetchFn ?? fetch;
     this.now = options.now ?? Date.now;
+    this.redisClient=options.redisClient ?? (options.redisUrl ? createClient({url:options.redisUrl,disableOfflineQueue:true}) as RedisClientType : undefined);
+    this.ownsRedis=Boolean(options.redisUrl && !options.redisClient);
+    this.redisPrefix=options.redisKeyPrefix ?? 'sec:';
   }
 
   /**
@@ -351,6 +362,24 @@ export class GoogleRevocationSource implements RevocationSource {
   }
 
   private async executeRefresh(): Promise<Set<string>> {
+    if (this.redisClient) {
+      try {
+        if (!this.redisClient.isReady) await this.redisClient.connect();
+        const cached=await this.redisClient.get(this.redisPrefix+'crl:snapshot');
+        if(cached){ const value=JSON.parse(cached) as {serials:string[];expiresAt:number}; if(value.expiresAt>this.now()){ this.snapshot={serials:new Set(value.serials),fetchedAt:this.now(),effectiveTtlMs:value.expiresAt-this.now()}; return this.snapshot.serials; } }
+        const token=crypto.randomUUID();
+        const lock=await this.redisClient.set(this.redisPrefix+'lock:crl',token,{NX:true,EX:30});
+        if(lock!=='OK') { await new Promise(r=>setTimeout(r,1000)); const waitValue=await this.redisClient.get(this.redisPrefix+'crl:snapshot'); if(waitValue){const v=JSON.parse(waitValue) as {serials:string[];expiresAt:number}; if(v.expiresAt>this.now()){this.snapshot={serials:new Set(v.serials),fetchedAt:this.now(),effectiveTtlMs:v.expiresAt-this.now()};return this.snapshot.serials;}} }
+        else {
+          try { const res=await this.fetchAndCacheRedis(); return res; }
+          finally { await this.redisClient.eval("if redis.call('GET',KEYS[1])==ARGV[1] then return redis.call('DEL',KEYS[1]) else return 0 end",{keys:[this.redisPrefix+'lock:crl'],arguments:[token]}).catch(()=>{}); }
+        }
+      } catch { /* Redis failure falls back to direct upstream fetch. */ }
+    }
+    return this.fetchAndCacheRedis(false);
+  }
+
+  private async fetchAndCacheRedis(cacheRedis = true): Promise<Set<string>> {
     const fetchTime = this.now();
     let result: RevocationFetchResult;
 
@@ -377,7 +406,17 @@ export class GoogleRevocationSource implements RevocationSource {
       fetchedAt: fetchTime,
       effectiveTtlMs: effectiveTtl,
     };
+    if(cacheRedis && this.redisClient?.isReady) {
+      const ttl=Math.max(1,Math.ceil(effectiveTtl/1000));
+      await this.redisClient.set(this.redisPrefix+'crl:snapshot',JSON.stringify({serials:[...result.serials],expiresAt:fetchTime+effectiveTtl}),{EX:ttl}).catch(()=>{});
+    }
 
     return result.serials;
+  }
+
+  public async close(): Promise<void> {
+    if (this.ownsRedis && this.redisClient?.isOpen) {
+      await this.redisClient.quit().catch(() => {});
+    }
   }
 }

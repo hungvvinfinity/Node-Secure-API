@@ -15,8 +15,13 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - run: npm run test:docker
       - run: npm ci
+      - name: Fast Fail Typecheck, Lint & Fast Unit Tests
+        run: |
+          npm run typecheck
+          npm run lint
+          npm run test:fast
+      - run: npm run test:docker
       - run: npm run stack:demo
       - run: npm run test:stack
       - run: npm run stack:demo:down
