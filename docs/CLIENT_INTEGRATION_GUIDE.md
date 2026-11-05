@@ -45,17 +45,18 @@ Mọi request gửi tới endpoint nghiệp vụ phải đính kèm tập header
 
 ### 1.2 Kiến trúc phân tầng bất đối xứng (Dual-Tier Architecture)
 
-Nhằm vừa đảm bảo an ninh tối đa cho các thiết bị cao cấp, vừa giữ tương thích 100% với các thiết bị Android cũ, chip giá rẻ, máy đã unlock bootloader hoặc máy chạy ROM tùy biến không có Google Play Services, hệ thống áp dụng cơ chế **Dual-Tier bất đối xứng**:
+> [!NOTE]
+> **Trạng thái cấu hình hiện tại**: Cơ chế **Tier 2: Software Protected** (giải thuật PoW, khóa phần mềm EC P-256 SPKI PEM, rolling lease 2 giờ, tarpit delay 3.000ms và in-flight concurrency lock) hiện đã **tạm thời ẩn / vô hiệu hóa** ở phía Client Integration để tập trung an ninh tuyệt đối vào cơ chế chứng thực phần cứng **Tier 1: Hardware VIP** (Android Key Attestation qua TEE / StrongBox và iOS Apple App Attest qua Secure Enclave). Toàn bộ luồng nghiệp vụ client hiện tại vận hành theo chuẩn Hardware VIP với độ trễ 0ms (Fast-Track) và lease vĩnh viễn (`expiresAt = null`).
 
-| Thuộc tính | Tier 1: Hardware VIP | Tier 2: Software Protected |
+| Thuộc tính | Tier 1: Hardware VIP (Hiện hành) | Tier 2: Software Protected (Tạm ẩn phía Client) |
 |---|---|---|
-| **Cơ chế xác thực khóa** | Android Key Attestation (Hardware TEE / StrongBox) | Proof of Work (PoW) + EC P-256 SPKI PEM |
-| **Chuỗi chứng chỉ** | X.509 Certificate Chain tới Google Hardware Root | SPKI PEM Public Key chuẩn |
+| **Cơ chế xác thực khóa** | Android Key Attestation (TEE / StrongBox) / iOS App Attest | Proof of Work (PoW) + EC P-256 SPKI PEM |
+| **Chuỗi chứng chỉ** | X.509 Certificate Chain tới Google Hardware Root / Apple CA | SPKI PEM Public Key chuẩn |
 | **Độ trễ xử lý (Tarpit Delay)** | **0 ms** (VIP Fast-Track) | **3.000 ms** (3.0s Tarpit Delay) |
-| **Thời hạn Lease** | **Vĩnh viễn** (Permanent Lease, `expiresAt = 0L`) | **Rolling Lease 2 giờ** (`softwareDeviceTtlSeconds = 7200`) |
+| **Thời hạn Lease** | **Vĩnh viễn** (Permanent Lease, `expiresAt = null`) | **Rolling Lease 2 giờ** (`softwareDeviceTtlSeconds = 7200`) |
 | **Giới hạn đồng thời** | Xử lý đa luồng theo queue | **Single In-Flight Lock** (tối đa 1 request/thiết bị tại một thời điểm) |
 | **Hạn mức tần suất (Rate Limit)** | Hạn mức tiêu chuẩn VIP | Giới hạn 6 RPM/thiết bị và giới hạn theo IP |
-| **Cơ chế phục hồi** | Duy trì khóa trong KeyStore | **Silent Renewal** tự động khi sắp hết hạn hoặc hết hạn |
+| **Cơ chế phục hồi** | Duy trì khóa trong KeyStore / Re-attest khi cần | **Silent Renewal** tự động khi sắp hết hạn hoặc hết hạn |
 
 ---
 
@@ -79,17 +80,14 @@ Server từ chối thẳng thừng với mã lỗi `401 EXPIRED_TIMESTAMP` nếu
   - `challenge`: Chuỗi 64 ký tự hex ngẫu nhiên (hoặc HMAC stateless).
   - `serverTime`: Mốc thời gian hiện tại của server.
   - `expiresAt`: Mốc hết hạn của challenge (thời hạn 60 giây).
-  - `pow`: Bộ tham số giải toán gồm `salt` (chuỗi hex) và `difficulty` (số bit 0 đầu, mặc định 18 bit trong production, 14 bit trong test).
+  - `pow`: Bộ tham số giải toán gồm `salt` (chuỗi hex) và `difficulty` (chỉ dùng cho Software Tier, hiện client bỏ qua trường này).
 - **Quy tắc tiêu thụ Challenge (Challenge Consumption)**:
   > [!IMPORTANT]
-  > Một challenge chỉ được sử dụng đúng một lần. Khi client gửi challenge lên `POST /api/auth/register-device`, server sẽ tiêu thụ challenge đó ngay lập tức (dù đăng ký thành công hay thất bại do chứng chỉ không hợp lệ).
+  > Một challenge chỉ được sử dụng đúng một lần (**Single-Use Guarantee**). Khi client gửi challenge lên `POST /api/auth/register-device`, server sẽ tiêu thụ challenge đó ngay lập tức trong Redis (dù đăng ký thành công hay thất bại do chứng chỉ không hợp lệ).
   >
-  > Do đó, khi client thử đăng ký **Tier 1 (Hardware)** nhưng bị server từ chối chính sách (ví dụ thiết bị unlock bootloader bị lỗi cert), client **BẮT BUỘC PHẢI XIN MỘT FRESH CHALLENGE MỚI** từ `/api/auth/challenge` trước khi giải PoW để đăng ký **Tier 2 (Software)**.
-
-- **Thuật toán giải PoW (Software Tier)**:
-  Thử lần lượt các số nguyên dương $nonce \ge 0$ dạng chuỗi decimal (`"0"`, `"1"`, `"2"`, ...), tìm hash:
-  $$\text{SHA256}(\text{UTF8}(challenge + ":" + salt + ":" + nonce))$$
-  sao cho hash có ít nhất `difficulty` bit 0 liên tiếp tính từ bit có trọng số lớn nhất (MSB) của byte đầu tiên. Client giải bài toán trên background thread (`Dispatchers.IO`), có giới hạn số vòng lặp an toàn (ví dụ: 50.000.000 iterations).
+  > Do đó, mỗi lần thử đăng ký hoặc tái đăng ký thiết bị phần cứng (Hardware Attestation), client **BẮT BUỘC PHẢI XIN MỘT FRESH CHALLENGE MỚI** từ `/api/auth/challenge`.
+  >
+  > *(Ghi chú: Cơ chế giải PoW thuộc Software Tier hiện tạm ẩn ở phía client. Client chỉ sử dụng challenge hex cho Hardware Key Attestation).*
 
 ---
 
@@ -145,7 +143,7 @@ Khi dịch vụ backend hoặc cụm Redis khởi động lại, server áp dụ
 ```
 *Ghi chú: `certificateChain` là mảng các chuỗi Base64 của chứng chỉ DER, sắp xếp từ Leaf Certificate đến Root Certificate.*
 
-#### Trường hợp 2: Đăng ký Tier 2 (Software Protected với PoW)
+#### Trường hợp 2: Đăng ký Tier 2 (Software Protected với PoW) — *[Tạm thời ẩn phía Client]*
 ```json
 {
   "challenge": "fresh_challenge_64_hex_value_here...",
@@ -153,6 +151,7 @@ Khi dịch vụ backend hoặc cụm Redis khởi động lại, server áp dụ
   "powNonce": "48291"
 }
 ```
+*(Lưu ý: Luồng đăng ký phần mềm qua PoW này hiện đã tạm ẩn ở ứng dụng client, server vẫn duy trì tương thích ngược nếu bật cờ cấu hình).*
 
 #### Trường hợp 3: Đăng ký iOS (Apple App Attest)
 ```json
@@ -1081,76 +1080,98 @@ actor AppAttestClient {
 
 ## 5. Bảng mã lỗi toàn diện và Hướng dẫn xử lý phía Client
 
-Đối chiếu 100% với các mã lỗi định nghĩa trong `src/core/security-service.ts` và `src/http/server.ts`:
+Đối chiếu 100% với các mã lỗi định nghĩa trong `src/core/errors.ts`, `src/core/security-service.ts`, `src/http/server.ts`, `src/platform/android.ts`, và `src/platform/ios.ts`:
 
 | Mã HTTP | Error Code | Ý nghĩa bản chất | Hành động chuẩn mực của Client |
 |---|---|---|---|
-| `401` | `RETRY_WITH_FRESH_TIMESTAMP` | Redis vừa khởi động lại (trong cửa sổ cách ly 15s quarantine). Timestamp request trước thời điểm boot. | **Không gửi lại gói cũ**. Lấy timestamp hiện tại mới, rút sequence mới, ký mới và retry ngay lập tức. |
-| `401` | `REPLAY_DETECTED` | Sequence $\le$ sequence đã ghi nhận trong cơ sở dữ liệu, hoặc request bị trùng lặp/đến sai thứ tự. | Không gửi lại gói cũ. Nếu nghiệp vụ cần retry: cấp sequence mới, timestamp mới, chữ ký mới, giữ nguyên `Idempotency-Key`. |
-| `401` | `INVALID_SIGNATURE` | Chữ ký số không khớp với chuỗi canonical (sai lệch byte body, sửa đổi query, hoặc sai khóa). | Kiểm tra tính toàn vẹn byte wire. Không retry mù quáng nếu dữ liệu body bị chỉnh sửa. |
-| `401` | `EXPIRED_TIMESTAMP` | Timestamp lệch quá ±15 giây so với giờ server hoặc không đúng định dạng. | Tự động kích hoạt luồng Silent Renewal / Fresh Challenge để đồng bộ lại `clockOffsetMs` và retry request. |
-| `401` | `DEVICE_NOT_REGISTERED` | Thiết bị không tồn tại trong database (hoặc đã bị xóa/reset). | Gọi `registerDeviceOnce(force = true)` ngầm để đăng ký lại từ đầu, sau đó retry request. |
-| `401` | `DEVICE_LEASE_EXPIRED` / `LEASE_EXPIRED` | Lease 2 giờ của Software Tier đã hết hạn. | Tự động kích hoạt Silent Renewal (xin challenge mới, giải PoW, đăng ký lại) và retry request tự động. |
-| `429` | `CONCURRENT_REQUEST_DISALLOWED` | Software Tier chặn gửi song song (đang có 1 request in-flight cùng device). | Sử dụng `RequestSerializationQueue` để tuần tự hóa; áp dụng backoff 1s–3s rồi thử lại request mới. |
-| `429` | `RATE_LIMIT_EXCEEDED` | Thiết bị hoặc địa chỉ IP vượt quá tần suất cho phép (Software Tier tối đa 6 RPM). | Backoff với exponential delay có jitter; thông báo giao diện nếu vượt ngưỡng quá lớn. |
-| `400` | `INVALID_CHALLENGE` | Challenge không hợp lệ, đã hết hạn 60s, hoặc đã bị tiêu thụ trước đó. | Bắt buộc gọi `POST /api/auth/challenge` để lấy challenge mới; không dùng lại payload cũ. |
-| `400` | `INVALID_SEQUENCE` | Sequence không đúng định dạng decimal, chứa số 0, leading zero, hoặc vượt quá signed int64 MAX. | Kiểm tra bộ sinh sequence; reset bộ đếm nếu cần thiết theo chính sách re-attestation. |
-| `400` | `INVALID_SIGN_COUNT` | (iOS) Apple App Attest signCount không tăng hoặc bị rollback. | Khởi động luồng Re-attest lại khóa mới theo chính sách Apple. |
-| `401` | `MISSING_SECURITY_HEADERS` | Thiếu một trong các headers: `X-Device-Id`, `X-Timestamp`, `X-Sequence`. | Kiểm tra cấu hình OkHttp Interceptor. |
-| `401` | `MISSING_SIGNATURE` / `MISSING_ASSERTION` | Thiếu chữ ký `X-Signature` (Android) hoặc assertion `X-Assertion` (iOS). | Kiểm tra `KeystoreManager` và quá trình tạo assertion. |
-| `400` | `INVALID_CERTIFICATE_CHAIN` / `INVALID_ATTESTATION` / `INVALID_PUBLIC_KEY` / `INVALID_POW` | Payload đăng ký không thỏa mãn định dạng hoặc sai giải thuật PoW. | Kiểm tra lại logic giải PoW và xuất chứng chỉ leaf-to-root. |
-| `503` | `STORE_ERROR` / `STORE_DOWN` | Replay engine (Redis / DB) tạm thời mất kết nối. | Exponential backoff có jitter; tạo proof mới cho mỗi lần retry; giữ nguyên `idempotencyKey`. |
+| **400** | `DUPLICATE_HEADER` | Phát hiện trùng lặp header an ninh trên wire (`X-Device-Id`, `X-Timestamp`, `X-Sequence`, `X-Signature`, `X-Assertion`). | Kiểm tra pipeline OkHttp/URLSession; đảm bảo interceptor không bị add lặp lại nhiều lần. |
+| **400** | `INVALID_JSON` | Payload gửi lên control endpoint không phải JSON hợp lệ (parse syntax error). | Kiểm tra chuỗi JSON trước khi gửi, tránh nối chuỗi thủ công gây lỗi cú pháp. |
+| **400** | `INVALID_REQUEST_BODY` | Body JSON là Array `[]` hoặc giá trị nguyên thủy thay vì Object `{}`. | Bọc payload trong một JSON Object chuẩn (`{ ... }`). |
+| **400** | `INVALID_PLATFORM` | Trường `platform` khác `"android"` hoặc `"ios"`. | Chỉ truyền giá trị `"android"` hoặc `"ios"`. |
+| **400** | `INVALID_CHALLENGE` | Định dạng hex challenge không đúng 64 ký tự hex. | Sử dụng chuỗi hex 64 ký tự nguyên bản nhận từ `/api/auth/challenge`. |
+| **400** | `INVALID_CERTIFICATE_CHAIN` | `certificateChain` không phải mảng chuỗi Base64 hợp lệ hoặc bị rỗng. | Đảm bảo mảng chứng chỉ DER X.509 được encode Base64 chuẩn và không rỗng. |
+| **400** | `INVALID_ATTESTATION` | Thiếu chứng thực đăng ký phần cứng (`certificateChain` hoặc `attestationObject`). | Cung cấp đầy đủ payload attestation theo từng nền tảng. |
+| **400** | `KEY_ID_MISMATCH` | (iOS) `keyId` không khớp SHA-256 của uncompressed EC public key trong attestation. | Kiểm tra lại logic sinh `keyId = SHA256(leafPublicKeyPoint).base64`. |
+| **400** | `ATTESTED_CREDENTIAL_DATA_FLAG_MISSING` | (iOS) Cờ AT (0x40) trong `authData` bị thiếu khi đăng ký. | Đảm bảo sử dụng đối tượng attestation sinh ra từ hàm `attestKey`. |
+| **400** | `INVALID_SIGN_COUNT` | (iOS) `signCount != 0` khi đăng ký; hoặc (Nghiệp vụ) `signCount` không phải số nguyên $1 \le x \le 2^{32}-1$. | Reset hoặc tạo mới cặp khóa trên iOS nếu `signCount` ban đầu không hợp lệ. |
+| **400** | `AAGUID_MISMATCH` | (iOS) AAGUID không khớp môi trường App Attest (`"appattest"` trên production, `"appattestdevelop"` trên test). | Kiểm tra môi trường build ứng dụng (App Store vs Development). |
+| **400** | `INVALID_SEQUENCE` | Sequence không đúng định dạng decimal (`^[1-9]\d{0,18}$`), chứa số 0 đầu, số âm, hoặc vượt quá signed int64 MAX ($2^{63}-1$). | Kiểm tra `AtomicSequenceGenerator`, đảm bảo sequence là số nguyên dương strictly increasing dạng chuỗi decimal. |
+| **400** | `INVALID_TIMESTAMP` | Timestamp không đúng định dạng decimal nguyên dương milliseconds (`^[1-9]\d{0,15}$`). | Sử dụng Unix epoch milliseconds nguyên bản dạng chuỗi số. |
+| **400** | `REQUEST_ABORTED` | Kết nối bị ngắt đột ngột giữa chừng từ phía client trong khi truyền tải body. | Kiểm tra độ ổn định kết nối mạng, tránh ngắt stream sớm. |
+| **401** | `INVALID_CHALLENGE` | Challenge HMAC không hợp lệ, sai chữ ký, hết hạn 60s, hoặc đã bị tiêu thụ (**Single-Use Violation**). | Bắt buộc gọi `POST /api/auth/challenge` lấy challenge mới trước khi đăng ký lại. |
+| **401** | `EXPIRED_TIMESTAMP` | Timestamp lệch quá $\pm 15.000$ms (15s) so với đồng hồ Server. | Tự động kích hoạt cơ chế bù lệch đồng hồ động (Dynamic Clock Offset Compensation) và retry request. |
+| **401** | `RETRY_WITH_FRESH_TIMESTAMP` | Redis vừa khởi động lại (trong cửa sổ cách ly 15s quarantine). Timestamp request trước thời điểm boot. | **Không gửi lại gói cũ**. Lấy timestamp hiện tại mới, rút sequence mới, ký mới và retry ngay lập tức (giữ nguyên `Idempotency-Key`). |
+| **401** | `REPLAY_DETECTED` | Sequence $\le$ sequence đã ghi nhận trong database, hoặc request bị trùng lặp/đến sai thứ tự. | Không gửi lại gói cũ. Nếu nghiệp vụ cần retry: cấp sequence mới, timestamp mới, chữ ký mới, giữ nguyên `Idempotency-Key`. |
+| **401** | `INVALID_SIGNATURE` | Chữ ký số không khớp với chuỗi canonical (sai lệch byte body, sửa đổi query, hoặc sai khóa). | Kiểm tra tính toàn vẹn byte wire. Đảm bảo serialize body đúng 1 lần và không format lại query string. |
+| **401** | `DEVICE_NOT_REGISTERED` | Thiết bị không tồn tại trong database (hoặc đã bị xóa/reset). | Tự động gọi `registerDeviceOnce(force = true)` ngầm để đăng ký lại từ đầu, sau đó retry request. |
+| **401** | `MISSING_SECURITY_HEADERS` | Thiếu một trong các headers bắt buộc: `X-Device-Id`, `X-Timestamp`, `X-Sequence`. | Kiểm tra cấu hình OkHttp Interceptor hoặc URLSession request headers. |
+| **401** | `MISSING_SIGNATURE` | (Android) Thiếu chữ ký `X-Signature`. | Kiểm tra `KeystoreManager.signData` và đính kèm header `X-Signature`. |
+| **401** | `MISSING_ASSERTION` | (iOS) Thiếu assertion `X-Assertion`. | Kiểm tra `DCAppAttestService.generateAssertion` và đính kèm header `X-Assertion`. |
+| **401** | `MALFORMED_DER_SIGNATURE` / `INVALID_SIGNATURE_LENGTH` | Chữ ký Android sai độ dài hoặc không đúng cấu trúc DER ASN.1 `SEQUENCE { r, s }`. | Bắt buộc định dạng DER ASN.1 chuẩn `(r, s)` được Base64 NO_WRAP. |
+| **401** | `SIGN_COUNT_NOT_INCREASED` / `COUNTER_ROLLBACK` | (iOS) `signCount` trong assertion không lớn hơn `signCount` đã lưu hoặc bị giảm. | Khởi động luồng re-attestation tạo cặp khóa mới theo chính sách Apple. |
+| **401** | `ASSERTION_TOO_LARGE` | (iOS) Header `X-Assertion` vượt quá hạn mức 8KB. | Kiểm tra lại đối tượng assertion CBOR được sinh ra từ hệ điều hành. |
+| **401** | `UNEXPECTED_ATTESTED_CREDENTIAL_DATA` | (iOS) Cờ AT xuất hiện trong assertion gọi API nghiệp vụ (chỉ được phép khi đăng ký). | Sử dụng đúng hàm `generateAssertion` thay vì gửi lại `attestationObject`. |
+| **401** | `RP_ID_MISMATCH` | (iOS) `rpIdHash` trong authData không khớp với `appId` (`TEAMID.bundleId`). | Kiểm tra cấu hình App Attest entitlements và App ID trên Apple Developer portal. |
+| **401** | `DEVICE_LEASE_EXPIRED` | *(Chỉ thuộc Software Tier cũ)* Lease 2 giờ đã hết hạn. | Hardware VIP có lease vĩnh viễn (`expiresAt = null`), không phát sinh mã lỗi này. |
+| **403** | `HARDWARE_TEE_REQUIRED` | Khóa KeyMint có cấp độ an ninh Software (0) thay vì TEE (1) hoặc StrongBox (2). | Thiết bị không đạt chuẩn phần cứng hoặc chạy trong môi trường giả lập không được hỗ trợ. |
+| **403** | `DEVICE_NOT_LOCKED` | Android Bootloader chưa khóa (`deviceLocked = false` trong RootOfTrust Tag 704). | Thiết bị đã mở khóa bootloader / can thiệp kernel, bị từ chối truy cập vì rủi ro an ninh. |
+| **403** | `BOOT_NOT_VERIFIED` | Trạng thái Android Verified Boot không phải `VERIFIED (0)`. | Hệ điều hành trên thiết bị đã bị chỉnh sửa (custom ROM hoặc root). |
+| **403** | `PACKAGE_NAME_MISMATCH` | Tên package trong Tag 709 không khớp `expectedPackageName`. | Khóa được tạo từ ứng dụng giả mạo tên package. |
+| **403** | `PACKAGE_VERSION_TOO_LOW` | Phiên bản app trong Tag 709 nhỏ hơn `minimumVersion`. | Yêu cầu người dùng nâng cấp ứng dụng lên phiên bản mới nhất. |
+| **403** | `SIGNER_DIGEST_MISMATCH` | Mã băm chứng chỉ ký APK trong Tag 709 không khớp cấu hình server. | Ứng dụng đã bị can thiệp và ký lại (repackaged APK). |
+| **403** | `ATTESTATION_CHALLENGE_MISMATCH` | Challenge trong chứng chỉ Android / iOS không khớp challenge do server cấp. | Chống Replay: Đảm bảo nhúng đúng chuỗi byte challenge UTF-8 vào KeyGenParameterSpec / clientDataHash. |
+| **403** | `UNTRUSTED_ROOT_CA` | Root CA của chuỗi chứng chỉ không thuộc danh sách Google Hardware Roots hoặc Apple Root CA. | Chuỗi chứng chỉ giả mạo hoặc tự ký không hợp lệ. |
+| **403** | `CHAIN_EXTENDED_WITH_FAKE_ATTESTATION_EXTENSION` | Phát hiện tấn công mở rộng chuỗi giả mạo (Anti-extension attack). | Extension Key Attestation chỉ được phép nằm duy nhất ở Leaf Certificate. |
+| **403** | `CERTIFICATE_REVOKED` | Chứng chỉ nằm trong danh sách thu hồi CRL của Google hoặc Apple. | Khóa phần cứng của model thiết bị đã bị lộ lọt và nhà sản xuất đã thu hồi. |
+| **403** | `CERTIFICATE_EXPIRED` | Chứng chỉ trung gian hoặc chứng chỉ leaf trong chuỗi đã hết hạn. | Kiểm tra đồng hồ hệ thống hoặc chuỗi chứng chỉ thiết bị. |
+| **403** | `INVALID_APP_ATTEST_RECEIPT` / `RECEIPT_EXPIRED` / `RECEIPT_APP_ID_MISMATCH` | Biên lai Apple App Attest không hợp lệ, hết hạn hoặc sai App ID. | Thẩm tra biên lai Apple App Attest thất bại; yêu cầu khởi tạo lại khóa mới. |
+| **403** | `BUNDLE_VERSION_TOO_LOW` | (iOS) Bundle version trong App Properties nhỏ hơn phiên bản yêu cầu. | Yêu cầu người dùng cập nhật ứng dụng iOS từ App Store. |
+| **405** | `METHOD_NOT_ALLOWED` | Phương thức HTTP không được hỗ trợ (ví dụ dùng `GET` vào `/api/auth/challenge`). | Tuân thủ đặc tả: Sử dụng phương thức `POST` cho các control endpoints. |
+| **409** | `DEVICE_ALREADY_REGISTERED` | Thiết bị (`deviceId`) đã được đăng ký trước đó (vi phạm cờ `createDeviceNX`). | Không đăng ký đè; giữ nguyên cặp khóa hiện tại để gọi API nghiệp vụ. |
+| **413** | `PAYLOAD_TOO_LARGE` | Dung lượng body vượt quá hạn mức: 64KB (control endpoint) hoặc 1MB (business endpoint). | Tối ưu hóa kích thước dữ liệu gửi đi hoặc phân trang payload. |
+| **415** | `UNSUPPORTED_MEDIA_TYPE` | Thiếu `Content-Type: application/json` tại các endpoint nhận body. | Đính kèm header `Content-Type: application/json; charset=utf-8`. |
+| **415** | `UNSUPPORTED_ENCODING` | Request chứa `Content-Encoding: gzip/deflate/br` (bị từ chối để giữ toàn vẹn canonical wire). | Tắt tính năng nén HTTP body trên client đối với các request ký an ninh. |
+| **429** | `CONCURRENT_REQUEST_DISALLOWED` / `RATE_LIMIT_EXCEEDED` | *(Chỉ thuộc Software Tier cũ)* Bị chặn concurrency lock hoặc rate limit. | Hardware VIP không áp dụng concurrency lock đơn luồng; hỗ trợ gọi đa luồng chuẩn. |
+| **503** | `STORE_DOWN` / `STORE_ERROR` | Replay engine (Redis / DB) tạm thời mất kết nối hoặc quá hạn xử lý. | Exponential backoff có jitter; tạo sequence và timestamp mới cho lần retry; giữ nguyên `Idempotency-Key`. |
+| **503** | `PLATFORM_TRUST_NOT_READY` | Server chưa hoàn thành đồng bộ cache chứng chỉ gốc hoặc danh sách CRL. | Chờ server sẵn sàng (poll `GET /ready`) rồi thực hiện đăng ký. |
+| **503** | `REVOCATION_STATUS_UNAVAILABLE` | Danh sách thu hồi CRL Google bị stale mà không thể kết nối cập nhật (fail-closed). | Server fail-closed bảo vệ an ninh; thử lại sau ít phút khi mạng server ổn định. |
 
 ---
 
 ## 6. Sơ đồ luồng giao thức (Mermaid Sequence Diagrams)
 
-### 6.1 Luồng Đăng ký Dual-Tier & Chuyển tầng khi Tiêu thụ Challenge
+### 6.1 Luồng Đăng ký Hardware Attestation & Tiêu thụ Challenge (Single-Use)
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor User as Người dùng
-    participant App as Android Client
-    participant KeyStore as KeystoreManager
+    participant App as Mobile Client (Android/iOS)
+    participant KeyStore as Hardware Enclave (TEE / SE)
     participant Server as Node-Secure-API
-    participant Redis as Redis Replay Store
+    participant Redis as Redis Store
 
-    User->>App: Mở ứng dụng / Yêu cầu kết nối
-    App->>Server: POST /api/auth/challenge {"platform":"android"}
-    Server-->>App: challenge (64-hex), serverTime, pow {salt, difficulty}
+    User->>App: Mở ứng dụng / Khởi tạo an ninh
+    App->>Server: POST /api/auth/challenge {"platform":"android"} (hoặc "ios")
+    Server-->>App: challenge (64-hex), serverTime, expiresAt (60s)
     App->>App: Tính clockOffsetMs = serverTime - localTime
 
     rect rgb(235, 245, 255)
-        note over App,KeyStore: GIAI ĐOẠN 1: THỬ TIER 1 (HARDWARE VIP)
-        App->>KeyStore: generateAttestedKeyPair(challenge)
-        KeyStore-->>App: Cặp khóa P-256 + Cert Chain
-        App->>Server: POST /api/auth/register-device {challenge, certificateChain}
-        note over Server: Server tiêu thụ Challenge (Consumed!)
-        alt Thiết bị đạt chuẩn Hardware Attestation
+        note over App,KeyStore: XÁC THỰC PHẦN CỨNG VIP (HARDWARE ATTESTATION)
+        App->>KeyStore: Sinh cặp khóa EC P-256 gắn challenge vào Attestation
+        KeyStore-->>App: Cặp khóa P-256 + Certificate Chain (Android) / Attestation Object (iOS)
+        App->>Server: POST /api/auth/register-device {challenge, certificateChain / attestationObject}
+        note over Server,Redis: Server tiêu thụ Challenge ngay lập tức trong Redis (Single-Use Guarantee)
+        alt Thiết bị đạt chuẩn Hardware Attestation (Bootloader Locked, TEE/SE Valid)
             Server-->>App: 200 OK {deviceId, tier: "hardware", expiresAt: null}
-            App->>App: Lưu Tier 1, Lease Vĩnh viễn (0ms delay)
-        else Server từ chối cert (Bootloader unlock / Emulation)
-            Server-->>App: 400 INVALID_CERTIFICATE_CHAIN
-            note over App: Thất bại! Chuyển sang Tier 2 Fallback
+            App->>App: Lưu DeviceId, Xác lập Hardware VIP (0ms delay, Permanent Lease)
+            App->>App: AtomicSequenceGenerator.reset(0L)
+            App-->>User: Đăng ký thành công!
+        else Thiết bị không đạt chuẩn (Unlocked Bootloader / Root / Emulation)
+            Server-->>App: 403 Forbidden {error: "DEVICE_NOT_LOCKED" / "HARDWARE_TEE_REQUIRED"}
+            App-->>User: Cảnh báo thiết bị không đủ điều kiện an ninh phần cứng!
         end
     end
-
-    opt Nếu Tier 1 Thất bại: Chuyển sang Tier 2 Fallback
-        rect rgb(255, 245, 235)
-            note over App,Server: GIAI ĐOẠN 2: FALLBACK TIER 2 (SOFTWARE PROTECTED)
-            App->>Server: POST /api/auth/challenge (XIN FRESH CHALLENGE VÌ CŨ ĐÃ TIÊU THỤ)
-            Server-->>App: fresh_challenge, fresh_pow {salt, difficulty}
-            App->>KeyStore: generateSoftwareKeyPair()
-            App->>App: ProofOfWorkSolver.solveProofOfWork(fresh_challenge, salt, diff)
-            App->>Server: POST /api/auth/register-device {challenge: fresh_challenge, publicKeyPem, powNonce}
-            Server-->>App: 200 OK {deviceId, tier: "software", expiresAt: now + 2h}
-            App->>App: Lưu Tier 2, Kích hoạt Rolling Lease 2h & Tarpit 3.0s
-        end
-    end
-
-    App->>App: AtomicSequenceGenerator.reset(0L)
-    App-->>User: Đăng ký thành công!
 ```
 
 ---
@@ -1164,25 +1185,25 @@ sequenceDiagram
     participant Queue as RequestSerializationQueue
     participant Interceptor as AttestationSigningInterceptor
     participant Disk as Flash Storage (commit)
-    participant KeyStore as KeystoreManager
+    participant KeyStore as KeystoreManager / Secure Enclave
     participant Server as Node-Secure-API
 
     Caller->>Queue: executeSerialized { readTarotWithRetry() }
-    Queue->>Queue: coroutineMutex.withLock
+    Queue->>Queue: coroutineMutex.withLock (tuần tự hóa)
     Queue->>Interceptor: httpClient.newCall(request).execute()
     Interceptor->>Interceptor: synchronized(wireLock)
     
     rect rgb(240, 255, 240)
-        note over Interceptor,Disk: BẢO VỆ TUẦN TỰ HOÀN TOÀN
+        note over Interceptor,Disk: BẢO VỆ TUẦN TỰ HOÀN TOÀN TRÊN WIRE
         Interceptor->>Interceptor: Timestamp = localTime + clockOffsetMs
         Interceptor->>Disk: AtomicSequenceGenerator.nextSequence() -> commit() to disk
         Disk-->>Interceptor: sequence đã ghi đĩa bền vững
-        Interceptor->>Interceptor: Canonical = timestamp:sequence:METHOD:target:SHA256(body)
-        Interceptor->>KeyStore: signData(canonical)
-        KeyStore-->>Interceptor: DER signature Base64
-        Interceptor->>Server: Wire Request + 4 Headers an ninh + Idempotency-Key
-        note over Server: Software Tier: Áp dụng Tarpit Delay 3.0s & Concurrency Lock
-        Server-->>Interceptor: Response (200 OK / 401 / 429 / 5xx)
+        Interceptor->>Interceptor: Canonical = timestamp:sequence:METHOD:target:SHA256(rawBody)
+        Interceptor->>KeyStore: signData(canonical) -> Chữ ký DER ASN.1 / Assertion
+        KeyStore-->>Interceptor: DER signature Base64 (Android) / Assertion Base64 (iOS)
+        Interceptor->>Server: Wire Request + Security Headers + Idempotency-Key
+        note over Server: Hardware Tier: 0ms Tarpit Delay (Fast-Track VIP), Atomic CAS Replay Check
+        Server-->>Interceptor: Response (200 OK / 401 / 403 / 5xx)
     end
     
     Interceptor-->>Queue: Response
@@ -1191,7 +1212,7 @@ sequenceDiagram
 
 ---
 
-### 6.3 Luồng Tự động Phục hồi Ngầm (Silent Renewal Recovery)
+### 6.3 Luồng Tự động Phục hồi Ngầm (Hardware Silent Recovery)
 
 ```mermaid
 sequenceDiagram
@@ -1201,52 +1222,97 @@ sequenceDiagram
     participant Server as Node-Secure-API
 
     Retry->>Server: Request Tarot (Gói tin A: Seq n, Ts t)
-    Server-->>Retry: 401 Unauthorized {"error":"DEVICE_LEASE_EXPIRED"}
-    note over Retry: Phát hiện Lease 2h đã hết hạn! Kích hoạt Silent Renewal
-
-    rect rgb(255, 240, 245)
-        note over Retry,Server: TIẾN TRÌNH SILENT RENEWAL NGẦM
+    alt Trường hợp 1: Lệch đồng hồ (Clock Skew > 15s)
+        Server-->>Retry: 401 Unauthorized {"error":"EXPIRED_TIMESTAMP"}
+        note over Retry: Tự động kích hoạt bù lệch thời gian ngầm
+        Retry->>Api: POST /api/auth/challenge
+        Api->>Server: Lấy fresh serverTime
+        Server-->>Api: serverTime mới
+        Api->>Api: Cập nhật lại clockOffsetMs = serverTime - localTime
+        note over Retry: Retry gói tin mới: Ts bù lệch mới, Seq n+1 mới, Sig mới, Idempotency-Key CŨ
+        Retry->>Server: Request Tarot mới
+        Server-->>Retry: 200 OK {"status":"SUCCESS"}
+    else Trường hợp 2: Thiết bị chưa đăng ký (Database Reset)
+        Server-->>Retry: 401 Unauthorized {"error":"DEVICE_NOT_REGISTERED"}
+        note over Retry: Kích hoạt Re-Attestation phần cứng ngầm
         Retry->>Api: registerDeviceOnce(force = true)
-        Api->>Server: POST /api/auth/challenge
-        Server-->>Api: fresh_challenge, fresh_pow
-        Api->>Api: Giải PoW & Đăng ký lại Software Key
-        Api->>Server: POST /api/auth/register-device
-        Server-->>Api: 200 OK (deviceId mới, lease 2h mới)
+        Api->>Server: POST /api/auth/challenge -> Fresh challenge
+        Api->>Server: POST /api/auth/register-device -> Hardware Registration
+        Server-->>Api: 200 OK (deviceId mới)
         Api->>Api: Reset sequence về 0
+        note over Retry: Retry gói tin mới: Seq 1 mới, Ts mới, Sig mới, Idempotency-Key CŨ
+        Retry->>Server: Request Tarot mới
+        Server-->>Retry: 200 OK {"status":"SUCCESS"}
     end
-
-    note over Retry: Tự động retry với chu kỳ mới
-    Retry->>Server: Request Tarot mới (Gói tin B: Seq 1 mới, Ts mới, Sig mới, Idempotency-Key CŨ)
-    Server-->>Retry: 200 OK {"status":"SUCCESS","data":{...}}
-    Retry-->>Retry: Thành công 100%, người dùng không nhận thấy gián đoạn!
 ```
 
 ---
 
-## 7. Ma trận Kiểm thử Tự động Toàn diện (Simulator & Unit Tests)
+## 7. Ma trận Kiểm thử Tự động Toàn diện (100% Backend Coverage)
 
-Bộ kiểm thử giả lập `demo/client/simulator/client_simulator.ts` và 4 bộ unit test Kotlin xác minh toàn diện 100% các điều kiện biên:
+Ma trận kiểm thử dưới đây bao quát **100% các điều kiện biên, luồng nghiệp vụ và mã lỗi thực tế của Backend**, tập trung hoàn toàn vào **Hardware Attestation VIP** (Android Key Attestation & iOS Apple App Attest) và **HTTP Wire/Transport Layer Guard**, loại bỏ hoàn toàn các trường hợp của Software Tier:
 
-| Test ID | Hạng mục | Tình huống kiểm thử | Thiết lập & Hành động | Kết quả mong đợi |
-|---|---|---|---|---|
-| **SIM-01** | Hardware VIP | Lấy Challenge & Metadata PoW | `POST /api/auth/challenge` với `platform: "android"` | HTTP 200, nhận `challenge` 64-hex, `serverTime`, và object `pow` (difficulty, salt). |
-| **SIM-02** | Hardware VIP | Đăng ký thiết bị VIP (Permanent) | Gửi `certificateChain` X.509 hợp lệ gắn với challenge UTF-8 | HTTP 200, `tier: "hardware"`, `expiresAt: null`. |
-| **SIM-03** | Hardware VIP | Request nhanh không trễ (Fast-Track) | Gửi request Tarot có chữ ký hợp lệ trên Hardware Tier | HTTP 200, độ trễ xử lý < 400ms (0ms tarpit delay). |
-| **SIM-04** | An ninh Replay | Chặn Replay tấn công gói cũ | Phát lại nguyên vẹn gói tin ở SIM-03 (cùng Sequence 1, Timestamp, Chữ ký) | **HTTP 401 REPLAY_DETECTED**. Sequence không bị commit lặp lại. |
-| **SIM-05** | Toàn vẹn Body | Chặn gói tin bị sửa đổi (Tamper) | Giữ nguyên 4 headers an ninh nhưng thay đổi nội dung JSON body | **HTTP 401 INVALID_SIGNATURE**. Băm SHA256 không khớp canonical. |
-| **SIM-06** | Timestamp Skew | Chặn Timestamp quá hạn (>15s) | Gửi timestamp = `serverTime - 30.000ms` | **HTTP 401 EXPIRED_TIMESTAMP**. Request bị chặn trước khi commit sequence. |
-| **SIM-07** | Sequence Monotony | Chặn Sequence đi lùi / Out-of-Order | Gửi Sequence 1 khi database server đã ghi nhận Sequence $\ge 2$ | **HTTP 401 REPLAY_DETECTED**. Server yêu cầu sequence strictly increasing. |
-| **SIM-08** | Idempotency | Safe Retry bảo toàn Idempotency Key | Mô phỏng retry: cấp sequence mới, timestamp mới, giữ nguyên `Idempotency-Key` | HTTP 200. Server nhận diện cùng thao tác nghiệp vụ, không sinh tác vụ phụ. |
-| **SIM-09** | Software PoW | Giải thuật PoW & Sinh SPKI PEM | Sinh EC P-256 SPKI PEM, giải PoW theo salt & difficulty trả về | Tìm được `powNonce` hợp lệ thỏa mãn số leading zero bits. |
-| **SIM-10** | Software Tier | Đăng ký Software Tier (2h Lease) | Gửi `challenge`, `publicKeyPem`, `powNonce` | HTTP 200, `tier: "software"`, `expiresAt` là mốc 2 giờ tiếp theo. |
-| **SIM-11** | Software Defense | Thực thi Hàng rào Tarpit Delay | Gửi request Tarot trên Software Tier | HTTP 200, thời gian phản hồi thực tế $\ge 3.000$ms (hoặc $\ge 600$ms trong test). |
-| **SIM-12** | Software Security | Chống Replay & Tamper trên Software Tier | Thử nghiệm replay sequence và sửa đổi body trên Software Tier | **HTTP 401 REPLAY_DETECTED** và **HTTP 401 INVALID_SIGNATURE**. |
-| **SIM-13** | Software Defense | Khóa đồng thời Concurrency Lock | Phát 2 request song song đồng thời từ cùng một `deviceId` | Request 1 trả về HTTP 200; Request 2 bị chặn: **HTTP 429 CONCURRENT_REQUEST_DISALLOWED**. |
-| **SIM-14** | Software Lifecycle | Hết hạn Lease 2h & Silent Renewal | Giả lập thời gian trôi qua 3 giờ (vượt lease TTL); sau đó kích hoạt Silent Renewal | Gói tin cũ trả về **HTTP 401 DEVICE_LEASE_EXPIRED**; Silent Renewal giải PoW mới, tái đăng ký và request phục hồi thành công HTTP 200. |
+| Test ID | Hạng mục / Platform | Tình huống kiểm thử | Thiết lập & Hành động (Setup & Action) | Mã lỗi / HTTP Status mong đợi | Mục tiêu kiểm thử |
+|---|---|---|---|---|---|
+| **TC-SYS-01** | System Probe | Liveness probe kiểm tra server hoạt động | Gửi `GET /health` hoặc `GET /api/health` | **HTTP 200 OK**<br>`{ "status": "UP" }` | Đảm bảo process server đang chạy và tiếp nhận kết nối HTTP. |
+| **TC-SYS-02** | System Probe | Readiness probe phát hiện Redis / Trust chưa sẵn sàng | Giả lập Redis mất kết nối (`store.ping()` trả về `false`), gửi `GET /ready` | **HTTP 503 Service Unavailable**<br>`{ "status": "NOT_READY", "error": "STORE_DOWN" }` | Fail-closed: Ngăn router điều hướng traffic khi storage chưa sẵn sàng. |
+| **TC-HTTP-01**| HTTP Wire Guard | Phát hiện và chặn Duplicate Security Headers | Gửi raw HTTP request có 2 dòng header `X-Device-Id: dev-1` và `X-Device-Id: dev-2` | **HTTP 400 Bad Request**<br>`{ "error": "DUPLICATE_HEADER" }` | Chống HTTP header pollution / smuggling bypass proxy. |
+| **TC-HTTP-02**| HTTP Wire Guard | Chặn nén HTTP để bảo toàn byte canonical | Gửi request có header `Content-Encoding: gzip` kèm body nén | **HTTP 415 Unsupported Media Type**<br>`{ "error": "UNSUPPORTED_ENCODING" }` | Bảo toàn byte wire nguyên thủy, tránh mâu thuẫn canonical hash giữa Client và Server. |
+| **TC-HTTP-03**| HTTP Wire Guard | Chặn sai Content-Type tại control endpoint | Gửi `POST /api/auth/challenge` với `Content-Type: text/plain` | **HTTP 415 Unsupported Media Type**<br>`{ "error": "UNSUPPORTED_MEDIA_TYPE" }` | Bắt buộc định dạng chuẩn JSON cho control endpoints. |
+| **TC-HTTP-04**| HTTP Wire Guard | Chặn JSON vỡ cú pháp (Malformed JSON) | Gửi `POST /api/auth/challenge` với body `{"platform": "android"` (thiếu ngoặc đóng) | **HTTP 400 Bad Request**<br>`{ "error": "INVALID_JSON" }` | Ngăn crash parser, trả mã lỗi an ninh chuẩn hóa. |
+| **TC-HTTP-05**| HTTP Wire Guard | Chặn JSON payload không phải Object | Gửi `POST /api/auth/register-device` với body mảng `["challenge", "chain"]` | **HTTP 400 Bad Request**<br>`{ "error": "INVALID_REQUEST_BODY" }` | Ép kiểu dữ liệu request body phải là JSON Object `{}`. |
+| **TC-HTTP-06**| HTTP Wire Guard | Chặn body vượt quá giới hạn (Payload Too Large) | Gửi `POST /api/auth/register-device` > 64KB; hoặc `POST /api/tarot/read` > 1MB | **HTTP 413 Payload Too Large**<br>`{ "error": "PAYLOAD_TOO_LARGE" }` | Chống tấn công DoS tràn bộ nhớ buffer stream. |
+| **TC-HTTP-07**| HTTP Wire Guard | Chặn sai phương thức HTTP (Method Not Allowed) | Gửi `GET /api/auth/challenge` hoặc `GET /api/auth/register-device` | **HTTP 405 Method Not Allowed**<br>`{ "error": "METHOD_NOT_ALLOWED" }` | Tuân thủ đặc tả RESTful: các endpoint xác thực bắt buộc dùng POST. |
+| **TC-CHAL-01**| Challenge Flow | Cấp phát Challenge hợp lệ cho Android | Gửi `POST /api/auth/challenge` kèm `{"platform": "android"}` | **HTTP 200 OK**<br>Nhận `challenge` 64-hex, `expiresAt`, `serverTime` | Xác minh format stateless HMAC challenge 64 ký tự hex. |
+| **TC-CHAL-02**| Challenge Flow | Cấp phát Challenge hợp lệ cho iOS | Gửi `POST /api/auth/challenge` kèm `{"platform": "ios"}` | **HTTP 200 OK**<br>Nhận `challenge` có nhãn platform iOS, `serverTime` | Xác minh cấp phát challenge phân luồng theo nền tảng. |
+| **TC-CHAL-03**| Challenge Flow | Chặn tái sử dụng Challenge (**Single-Use Replay**) | Lấy 1 challenge, đăng ký thành công lần 1. Sau đó gửi lại chính challenge đó lần 2 | **HTTP 401 Unauthorized**<br>`{ "error": "INVALID_CHALLENGE" }` | Đảm bảo tính chất tiêu thụ 1 lần duy nhất (stateless atomic consume trong Redis). |
+| **TC-CHAL-04**| Challenge Flow | Chặn Challenge giả mạo HMAC hoặc hết hạn (>60s) | Tạo challenge ngẫu nhiên 64-hex không có chữ ký HMAC hợp lệ; hoặc gửi sau 65 giây | **HTTP 401 Unauthorized**<br>`{ "error": "INVALID_CHALLENGE" }` | Chống giả mạo thách thức và bảo đảm TTL ngắn hạn 60s. |
+| **TC-AND-REG-01**| Android KeyMint | Đăng ký thành công Thiết bị Hardware VIP | Gửi `certificateChain` X.509 hợp lệ ký trên TEE gắn với challenge UTF-8 | **HTTP 200 OK**<br>`status: "SUCCESS"`, `tier: "hardware"`, `expiresAt: null`, trả về `deviceId` | Xác lập định danh phần cứng vĩnh viễn không trễ tarpit. |
+| **TC-AND-REG-02**| Android KeyMint | Chặn thiết bị mở khóa Bootloader | Gửi chuỗi chứng chỉ có RootOfTrust Tag 704 với `deviceLocked = false` | **HTTP 403 Forbidden**<br>`{ "error": "DEVICE_NOT_LOCKED" }` | Ngăn chặn thiết bị đã bị root/unlock nạp kernel tùy biến. |
+| **TC-AND-REG-03**| Android KeyMint | Chặn trạng thái Boot không an toàn | Gửi chuỗi chứng chỉ có Tag 704 với `verifiedBootState` khác Verified (0) | **HTTP 403 Forbidden**<br>`{ "error": "BOOT_NOT_VERIFIED" }` | Bắt buộc hệ điều hành máy phải ở trạng thái Verified Boot nguyên bản. |
+| **TC-AND-REG-04**| Android KeyMint | Chặn cấp độ an ninh Software Emulation | Gửi chứng chỉ có `attestationSecurityLevel` hoặc `keymasterSecurityLevel` là Software (0) | **HTTP 403 Forbidden**<br>`{ "error": "HARDWARE_TEE_REQUIRED" }` | Chống giả lập Android hoặc app chạy trong môi trường ảo hóa không có TEE/StrongBox. |
+| **TC-AND-REG-05**| Android KeyMint | Chặn sai lệch Package Name | Gửi chứng chỉ có Tag 709 chứa package name lạ (`com.evil.app` thay vì `com.astrology.tarot`) | **HTTP 403 Forbidden**<br>`{ "error": "PACKAGE_NAME_MISMATCH" }` | Đảm bảo khóa phần cứng được sinh từ đúng ứng dụng mục tiêu. |
+| **TC-AND-REG-06**| Android KeyMint | Chặn app version thấp (Anti-downgrade) | Gửi chứng chỉ có Tag 709 chứa app version nhỏ hơn `minimumVersion` | **HTTP 403 Forbidden**<br>`{ "error": "PACKAGE_VERSION_TOO_LOW" }` | Chống tấn công hạ cấp phiên bản app về bản có lỗ hổng. |
+| **TC-AND-REG-07**| Android KeyMint | Chặn sửa đổi chữ ký app (Anti-Repackage) | Gửi chứng chỉ có Tag 709 chứa SHA-256 digest APK signature khác cấu hình server | **HTTP 403 Forbidden**<br>`{ "error": "SIGNER_DIGEST_MISMATCH" }` | Chống tấn công dịch ngược và repackage/re-sign ứng dụng Android. |
+| **TC-AND-REG-08**| Android KeyMint | Chặn Root CA không tin cậy | Gửi chuỗi chứng chỉ tự ký hoặc ký bởi Root CA lạ không thuộc Google Pinned Roots | **HTTP 403 Forbidden**<br>`{ "error": "UNTRUSTED_ROOT_CA" }` | Ngăn chặn kẻ tấn công tự tạo CA giả để lừa server. |
+| **TC-AND-REG-09**| Android KeyMint | Chặn tấn công mở rộng chuỗi giả mạo (Anti-Extension) | Cố tình tạo thêm cert con ký bởi leaf key và dời attestation extension xuống dưới | **HTTP 403 Forbidden**<br>`{ "error": "CHAIN_EXTENDED_WITH_FAKE_ATTESTATION_EXTENSION" }` | Đảm bảo attestation extension chỉ được phép nằm ở leaf certificate. |
+| **TC-AND-REG-10**| Android KeyMint | Chặn chứng chỉ bị thu hồi (Revocation CRL) | Gửi chuỗi chứng chỉ có serial number nằm trong danh sách thu hồi của Google | **HTTP 403 Forbidden**<br>`{ "error": "CERTIFICATE_REVOKED" }` | Bảo vệ chống lại các khóa TEE của thiết bị đã bị lộ lọt và Google thu hồi. |
+| **TC-AND-REG-11**| Android KeyMint | Chặn tham số khóa không hợp lệ (Không phải EC P-256) | Gửi chứng chỉ mà leaf public key là RSA thay vì EC P-256 | **HTTP 403 Forbidden**<br>`{ "error": "ATTESTED_KEY_NOT_EC" }` hoặc `HARDWARE_ALGORITHM_EC_REQUIRED` | Bắt buộc đường cong mật mã chuẩn EC P-256. |
+| **TC-AND-REG-12**| Android KeyMint | Chặn sai lệch Challenge trong chứng chỉ | Gửi chuỗi chứng chỉ mà challenge trong extension không khớp challenge server cấp | **HTTP 403 Forbidden**<br>`{ "error": "ATTESTATION_CHALLENGE_MISMATCH" }` | Chống tấn công phát lại chứng chỉ attestation cũ của phiên khác. |
+| **TC-AND-REG-13**| Android KeyMint | Chặn đăng ký lặp lại cùng một thiết bị | Gửi đăng ký 2 lần với cùng một cặp khóa phần cứng | Lần 1: **HTTP 200 OK**<br>Lần 2: **HTTP 409 Conflict**<br>`{ "error": "DEVICE_ALREADY_REGISTERED" }` | Tính bất biến: Không cho phép overwrite hoặc reset sequence của thiết bị đã đăng ký. |
+| **TC-IOS-REG-01** | iOS App Attest | Đăng ký thành công Thiết bị iOS Apple App Attest | Gửi `attestationObject` (CBOR) và `keyId` hợp lệ được Apple ký | **HTTP 200 OK**<br>`status: "SUCCESS"`, `tier: "hardware"`, `expiresAt: null`, trả về `deviceId` | Xác thực toàn vẹn thiết bị iOS Secure Enclave qua App Attest. |
+| **TC-IOS-REG-02** | iOS App Attest | Chặn sai lệch Key ID (`keyId` mismatch) | Gửi `keyId` bị sửa 1 byte (không khớp SHA-256 của EC uncompressed point) | **HTTP 400 Bad Request**<br>`{ "error": "KEY_ID_MISMATCH" }` | Đảm bảo định danh khóa khớp tuyệt đối với khóa công khai leaf. |
+| **TC-IOS-REG-03** | iOS App Attest | Chặn sai lệch Challenge Nonce trong extension | Tạo `attestationObject` với challenge khác; hoặc sửa đổi challenge context | **HTTP 403 Forbidden**<br>`{ "error": "ATTESTATION_CHALLENGE_MISMATCH" }` | Nonce phải khớp `SHA256(authData \|\| SHA256(challenge))`. |
+| **TC-IOS-REG-04** | iOS App Attest | Chặn sai lệch App ID / Team ID (RP ID Mismatch) | Gửi `authData` có `rpIdHash` khác với `SHA256(appId)` cấu hình server | **HTTP 401 Unauthorized**<br>`{ "error": "RP_ID_MISMATCH" }` | Đảm bảo khóa sinh từ đúng ứng dụng và Team ID của doanh nghiệp. |
+| **TC-IOS-REG-05** | iOS App Attest | Bắt buộc cờ Attested Credential Data (AT flag) | Gửi `authData` có byte cờ flags không bật bit AT (0x40) khi đăng ký | **HTTP 400 Bad Request**<br>`{ "error": "ATTESTED_CREDENTIAL_DATA_FLAG_MISSING" }` | Đảm bảo payload đăng ký mang đầy đủ thông tin credential public key. |
+| **TC-IOS-REG-06** | iOS App Attest | Chặn signCount ban đầu khác 0 khi đăng ký | Gửi `authData` có `signCount` ban đầu $> 0$ (ví dụ = 1) khi đăng ký | **HTTP 400 Bad Request**<br>`{ "error": "INVALID_SIGN_COUNT" }` | Chuẩn Apple App Attest: Số lần ký của khóa mới đăng ký bắt buộc phải bằng 0. |
+| **TC-IOS-REG-07** | iOS App Attest | Chặn AAGUID không khớp môi trường App Attest | Gửi `authData` có trường AAGUID khác `"appattest"` (hoặc `"appattestdevelop"`) | **HTTP 400 Bad Request**<br>`{ "error": "AAGUID_MISMATCH" }` | Đảm bảo đối tượng xác thực xuất phát từ dịch vụ Apple App Attest chuẩn. |
+| **TC-IOS-REG-08** | iOS App Attest | Chặn Root CA Apple không tin cậy | Gửi chuỗi chứng chỉ `x5c` không neo vào Apple App Attest Root CA | **HTTP 403 Forbidden**<br>`{ "error": "UNTRUSTED_ROOT_CA" }` | Bắt buộc neo tin cậy vào chứng chỉ gốc chính thức của Apple. |
+| **TC-IOS-REG-09** | iOS App Attest | Chặn Apple Receipt bị hết hạn hoặc sai lệch App ID | Gửi receipt có thời gian hết hạn trong quá khứ hoặc App ID khác | **HTTP 403 Forbidden**<br>`{ "error": "RECEIPT_EXPIRED" }` hoặc `RECEIPT_APP_ID_MISMATCH` | Thẩm tra biên lai Apple App Attest bảo đảm trạng thái cấp phép khóa còn hiệu lực. |
+| **TC-IOS-REG-10** | iOS App Attest | Chặn định dạng COSE Key không hợp lệ | Cung cấp khóa COSE có kty khác 2 (EC), alg khác -7 (ES256), hoặc crv khác 1 (P-256) | **HTTP 400 Bad Request**<br>`{ "error": "INVALID_COSE_KEY" }` / `INVALID_COSE_ALG` | Ép cấu hình mật mã chuẩn COSE ES256 P-256. |
+| **TC-IOS-REG-11** | iOS App Attest | Kiểm tra Bundle Version tối thiểu của iOS | Gửi chứng chỉ có extension App Properties với bundle version nhỏ hơn yêu cầu | **HTTP 403 Forbidden**<br>`{ "error": "BUNDLE_VERSION_TOO_LOW" }` | Quản lý vòng đời ứng dụng iOS và ngăn chặn các bản build cũ. |
+| **TC-REQ-AND-01**| Android Business | Gửi Request nghiệp vụ hợp lệ và nhận kết quả | Gửi request `POST /api/tarot/read` có chữ ký ECDSA P-256 hợp lệ, timestamp chuẩn, sequence = 1 | **HTTP 200 OK**<br>`status: "SUCCESS"`, trả về dữ liệu nghiệp vụ, độ trễ < 400ms | Xác minh luồng nghiệp vụ thông suốt, 0ms tarpit delay (Fast-Track). |
+| **TC-REQ-AND-02**| Android Business | Chặn phát lại gói tin cũ (**Replay Attack**) | Gửi lại y nguyên gói tin ở TC-REQ-AND-01 (cùng Sequence 1, Timestamp, Chữ ký) | **HTTP 401 Unauthorized**<br>`{ "error": "REPLAY_DETECTED" }` | Chống Replay: Redis Lua script từ chối cập nhật khi sequence mới $\le$ sequence cũ. |
+| **TC-REQ-AND-03**| Android Business | Chặn gói tin bị sửa đổi nội dung (**Body Tamper**) | Giữ nguyên 4 headers an ninh nhưng thay đổi 1 ký tự trong body JSON | **HTTP 401 Unauthorized**<br>`{ "error": "INVALID_SIGNATURE" }` | Toàn vẹn thông tin: Băm SHA-256 của wire body không khớp với chữ ký. |
+| **TC-REQ-AND-04**| Android Business | Chặn Timestamp bị lệch quá hạn (Clock Skew > 15s) | Gửi request có `X-Timestamp` lệch 20 giây so với đồng hồ Server | **HTTP 401 Unauthorized**<br>`{ "error": "EXPIRED_TIMESTAMP" }` | Ngăn chặn tấn công trì hoãn gói tin; buộc client phải bù lệch thời gian. |
+| **TC-REQ-AND-05**| Android Business | Chặn Sequence đi lùi hoặc không tăng (Out-of-Order) | Khi server đã ghi nhận Sequence = 5, client gửi request tiếp theo với Sequence = 4 hoặc 5 | **HTTP 401 Unauthorized**<br>`{ "error": "REPLAY_DETECTED" }` | Ràng buộc số thứ tự đơn điệu tăng nghiêm ngặt (Strictly Monotonic). |
+| **TC-REQ-AND-06**| Android Business | Chặn định dạng Sequence sai quy cách | Gửi `X-Sequence: "01"` (có leading zero), `"0"`, `"-1"`, hoặc `"abc"` | **HTTP 400 Bad Request**<br>`{ "error": "INVALID_SEQUENCE" }` | Kiểm soát chặt chẽ biểu thức chính quy số nguyên `^[1-9]\d{0,18}$`. |
+| **TC-REQ-AND-07**| Android Business | Chặn chữ ký DER ASN.1 bị lỗi định dạng | Gửi `X-Signature` có cấu trúc ASN.1 bị hỏng, thiếu giá trị `s` hoặc vượt quá 72 bytes | **HTTP 401 Unauthorized**<br>`{ "error": "MALFORMED_DER_SIGNATURE" }` | Đảm bảo tính hợp chuẩn của chữ ký ECDSA ASN.1 DER sequence. |
+| **TC-REQ-AND-08**| Android Business | Chặn thiết bị chưa đăng ký gọi API | Gửi request với `X-Device-Id` ngẫu nhiên chưa qua đăng ký | **HTTP 401 Unauthorized**<br>`{ "error": "DEVICE_NOT_REGISTERED" }` | Nguyên tắc Zero-Trust: Chỉ thiết bị đã chứng minh phần cứng mới được gọi API. |
+| **TC-REQ-IOS-01** | iOS Business | Gửi Request nghiệp vụ hợp lệ với Assertion | Gửi request `POST /api/tarot/read` có header `X-Assertion` hợp lệ, `signCount = 1`, sequence = 1 | **HTTP 200 OK**<br>`status: "SUCCESS"`, backend ghi nhận và tăng `signCount` lên 1 | Xác minh luồng gọi API thông suốt trên nền tảng Apple App Attest. |
+| **TC-REQ-IOS-02** | iOS Business | Chặn thiếu Header `X-Assertion` | Thiết bị iOS gửi request có `X-Device-Id`, `X-Timestamp`, `X-Sequence` nhưng thiếu `X-Assertion` | **HTTP 401 Unauthorized**<br>`{ "error": "MISSING_ASSERTION" }` | Buộc nền tảng iOS phải cung cấp App Attest Assertion làm proof. |
+| **TC-REQ-IOS-03** | iOS Business | Chặn Assertion quá lớn (> 8KB) | Gửi header `X-Assertion` có kích thước Base64 vượt quá 8KB | **HTTP 401 Unauthorized**<br>`{ "error": "ASSERTION_TOO_LARGE" }` | Phòng thủ chống cạn kiệt bộ nhớ và parser amplification. |
+| **TC-REQ-IOS-04** | iOS Business | Chặn cờ AT (Attested Credential) trong Assertion | Gửi assertion có cờ AT (0x40) được bật trong `authenticatorData` | **HTTP 401 Unauthorized**<br>`{ "error": "UNEXPECTED_ATTESTED_CREDENTIAL_DATA" }` | Chuẩn Apple: Cờ AT chỉ được phép xuất hiện lúc đăng ký, cấm trong assertion. |
+| **TC-REQ-IOS-05** | iOS Business | Chặn Rollback hoặc không tăng `signCount` trên iOS | Request 1 gửi `signCount = 5` thành công; Request 2 gửi tiếp tục `signCount = 5` hoặc `signCount = 4` | **HTTP 401 Unauthorized**<br>`{ "error": "SIGN_COUNT_NOT_INCREASED" }` | Bảo vệ phần cứng Apple: Phát hiện clone khóa hoặc tráo đổi assertion. |
+| **TC-REQ-IOS-06** | iOS Business | Chặn sửa đổi wire body đối với Assertion iOS | Giữ nguyên header `X-Assertion` nhưng sửa đổi 1 byte trong body JSON | **HTTP 401 Unauthorized**<br>`{ "error": "INVALID_SIGNATURE" }` | Composite hash `[authData \|\| SHA256(canonical)]` bị sai lệch chữ ký. |
+| **TC-REQ-IOS-07** | iOS Business | Chặn sai lệch RP ID trong Assertion | Gửi assertion có `rpIdHash` trong authData không khớp với `appId` | **HTTP 401 Unauthorized**<br>`{ "error": "RP_ID_MISMATCH" }` | Đảm bảo assertion được tạo riêng cho ứng dụng hiện tại. |
+| **TC-REQ-IOS-08** | iOS Business | Xác thực tuần tự tăng đồng bộ Sequence & signCount | Gửi 5 request liên tiếp với Sequence tăng dần (1, 2, 3, 4, 5) và signCount tăng dần (1, 2, 3, 4, 5) | **HTTP 200 OK** cho cả 5 request | Xác nhận tính trơn tru của cơ chế đếm kép (Dual Monotonic Counter) trên iOS. |
+| **TC-STORE-01** | Resilience/Cache| Chặn Replay trong cửa sổ Redis Quarantine (15s) | Giả lập Redis khởi động lại tại thời điểm $T_0$. Gửi request có timestamp $T < T_0$ trong vòng 15s sau boot | **HTTP 401 Unauthorized**<br>`{ "error": "RETRY_WITH_FRESH_TIMESTAMP" }` | Chống Replay các gói tin bị mất dữ liệu trong Redis do reboot/failover. |
+| **TC-STORE-02** | BigInt Precision| Hỗ trợ an toàn Sequence vượt giới hạn $2^{53}$ | Gửi Sequence = `9007199254740995` ($2^{53} + 3$), sau đó gửi tiếp `9007199254740996` | Cả 2 đều trả về **HTTP 200 OK**; Sequence nhỏ hơn trả về **401 REPLAY_DETECTED** | Chứng minh Redis Lua so sánh chuỗi số học BigInt chính xác, không tràn số IEEE 754. |
+| **TC-STORE-03** | Resilience/Cache| Fail-Closed khi Replay Engine / Redis mất kết nối | Ngắt kết nối Redis trong lúc đang xử lý request | **HTTP 503 Service Unavailable**<br>`{ "error": "STORE_ERROR" }` | Nguyên tắc an ninh: Thà từ chối phục vụ chứ tuyệt đối không cho phép bypass khi mất kiểm soát replay. |
 | **UNIT-01** | Canonical Format | Bảo toàn Query nguyên trạng | Query chứa `%2F`, tham số lộn xộn `q=%2F&z=2&a=1` | Chuỗi canonical giữ nguyên `%2F`, không sort thứ tự query, method viết hoa. |
-| **UNIT-02** | PoW Counting | Đếm Leading Zero Bits chính xác | Kiểm tra byte array từ 0 đến 18 bit 0 đầu | Kết quả đếm bit khớp tuyệt đối với giải thuật MSB. |
-| **UNIT-03** | Sequence Concurrency | Đa luồng 16 threads ghi đĩa | 16 threads chạy đồng thời sinh 1.600 sequence liên tiếp | Tất cả 1.600 sequence đều độc nhất (no duplicates), không đứt đoạn (no gaps), lưu bền vững. |
-| **UNIT-04** | Recovery Logic | Phục hồi ngầm sau lỗi EXPIRED_TIMESTAMP | Giả lập server trả lỗi 401 EXPIRED_TIMESTAMP | Client tự động re-sync offset thời gian và hoàn thành request trong lần thử thứ 2. |
+| **UNIT-02** | Sequence Concurrency | Đa luồng 16 threads ghi đĩa | 16 threads chạy đồng thời sinh 1.600 sequence liên tiếp (`AtomicSequenceGenerator`) | Tất cả 1.600 sequence đều độc nhất (no duplicates), không đứt đoạn (no gaps), lưu bền vững. |
+| **UNIT-03** | Recovery Logic | Phục hồi ngầm sau lỗi EXPIRED_TIMESTAMP | Giả lập server trả lỗi 401 EXPIRED_TIMESTAMP | Client tự động re-sync offset thời gian và hoàn thành request trong lần thử thứ 2. |
 
 ---
 
@@ -1258,7 +1324,7 @@ cd demo/client
 ./gradlew testDebugUnitTest
 ```
 
-### 8.2 Chạy bộ Simulator Verification Suite (14 Tests)
+### 8.2 Chạy bộ Simulator Verification Suite
 ```bash
 cd demo/client/simulator
 chmod +x run_simulation.sh
