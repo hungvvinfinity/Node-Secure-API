@@ -14,7 +14,7 @@ Backend không có shared secret nhúng trong APK/IPA. Hai platform dùng cùng 
 ## Android
 
 1. Xin challenge cho platform `android`.
-2. Tạo EC `secp256r1` trong AndroidKeyStore, purposes SIGN, digest SHA256, challenge UTF-8. Ưu tiên StrongBox nếu hỗ trợ; fallback TEE vẫn phải vượt policy của backend. Tắt userAuthenticationRequired cho key bảo vệ API theo thiết kế gốc.
+2. Tạo EC `secp256r1` trong AndroidKeyStore, purposes SIGN, digest SHA256, challenge UTF-8. **Ưu tiên TEE trước** để đạt tốc độ tối đa (~10–40ms nhờ ARMv8 Crypto trên CPU chính), tránh độ trễ chip rời của StrongBox (2–5s); chỉ fallback StrongBox nếu cần; cả TEE và StrongBox đều vượt policy Hardware VIP của backend. Tắt userAuthenticationRequired cho key bảo vệ API theo thiết kế gốc.
 3. Gửi `getCertificateChain(alias)` từ leaf tới root, mỗi certificate DER base64. Không gửi public key riêng để yêu cầu server tin.
 4. Lưu deviceId server trả về cùng key alias và sequence vào vùng không backup. Nếu đăng ký bị lặp, không yêu cầu backend reset sequence; dùng key mới khi cần re-attest theo lifecycle.
 5. Với mỗi request, serialize body **một lần**, tạo canonical từ byte sẽ gửi, ký `SHA256withECDSA` (DER sequence r,s), base64 chuẩn. Gửi X-Device-Id, X-Timestamp, X-Sequence, X-Signature.

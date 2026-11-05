@@ -22,7 +22,7 @@ import java.security.spec.ECGenParameterSpec
  * 1. Tier 1 (Hardware VIP):
  *    - Hardware-backed EC P-256 (secp256r1) key generated in AndroidKeyStore.
  *    - Bound to server attestation challenge.
- *    - StrongBox preferred with TEE fallback.
+ *    - TEE preferred for maximum speed (10-40ms on SoC), with StrongBox fallback.
  *    - Strictly PURPOSE_SIGN.
  *    - Exports X.509 certificate chain (Google Hardware Attestation Root).
  *
@@ -65,7 +65,7 @@ object KeystoreManager {
 
     /**
      * TIER 1: Generates a hardware-attested EC P-256 key pair bound to the challenge.
-     * Tries StrongBox first if supported; falls back to TEE.
+     * Prioritizes TEE first for maximum speed and sub-second latency; falls back to StrongBox.
      * Throws an exception if device hardware does not support hardware attestation.
      */
     @Synchronized
@@ -111,14 +111,22 @@ object KeystoreManager {
             return kpg.generateKeyPair()
         }
 
-        val keyPair = if (hasStrongBox) {
-            try {
-                generate(useStrongBox = true)
-            } catch (_: Throwable) {
-                generate(useStrongBox = false)
-            }
-        } else {
+        // TEE-first strategy for maximum throughput:
+        // Prioritize TEE (useStrongBox = false) running directly on the main SoC (ARM TrustZone)
+        // with hardware crypto acceleration (10-40ms). Fall back to StrongBox only if TEE fails.
+        val keyPair = try {
             generate(useStrongBox = false)
+        } catch (teeError: Throwable) {
+            if (hasStrongBox) {
+                try {
+                    generate(useStrongBox = true)
+                } catch (strongBoxError: Throwable) {
+                    teeError.addSuppressed(strongBoxError)
+                    throw teeError
+                }
+            } else {
+                throw teeError
+            }
         }
 
         activeTier = "hardware"
@@ -297,52 +305,50 @@ object KeystoreManager {
         if (!cached.isNullOrEmpty()) return cached
 
         val detected = try {
-            val hasStrongBox = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
-            } else false
-
-            if (hasStrongBox) {
-                "StrongBox"
-            } else {
-                val probeAlias = "_probe_hw_sec"
+            val probeAlias = "_probe_hw_sec"
+            try {
+                if (keyStore.containsAlias(probeAlias)) keyStore.deleteEntry(probeAlias)
+                val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+                kpg.initialize(
+                    KeyGenParameterSpec.Builder(probeAlias, KeyProperties.PURPOSE_SIGN)
+                        .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
+                        .setDigests(KeyProperties.DIGEST_SHA256)
+                        .build()
+                )
+                val kp = kpg.generateKeyPair()
+                val factory = KeyFactory.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+                val keyInfo = factory.getKeySpec(kp.private, KeyInfo::class.java)
+                val level = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    when (keyInfo.securityLevel) {
+                        KeyProperties.SECURITY_LEVEL_STRONGBOX -> "StrongBox"
+                        KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> "TEE"
+                        else -> "Software"
+                    }
+                } else {
+                    @Suppress("DEPRECATION")
+                    if (keyInfo.isInsideSecureHardware) "TEE" else "Software"
+                }
+                level
+            } catch (_: Throwable) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+                    context.packageManager.hasSystemFeature("android.hardware.hardware_keystore")) {
+                    "TEE"
+                } else {
+                    val hasStrongBox = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                        context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE)
+                    } else false
+                    if (hasStrongBox) "StrongBox" else "Software"
+                }
+            } finally {
                 try {
                     if (keyStore.containsAlias(probeAlias)) keyStore.deleteEntry(probeAlias)
-                    val kpg = KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
-                    kpg.initialize(
-                        KeyGenParameterSpec.Builder(probeAlias, KeyProperties.PURPOSE_SIGN)
-                            .setAlgorithmParameterSpec(ECGenParameterSpec("secp256r1"))
-                            .setDigests(KeyProperties.DIGEST_SHA256)
-                            .build()
-                    )
-                    val kp = kpg.generateKeyPair()
-                    val factory = KeyFactory.getInstance(KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
-                    val keyInfo = factory.getKeySpec(kp.private, KeyInfo::class.java)
-                    val level = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        when (keyInfo.securityLevel) {
-                            KeyProperties.SECURITY_LEVEL_STRONGBOX -> "StrongBox"
-                            KeyProperties.SECURITY_LEVEL_TRUSTED_ENVIRONMENT -> "TEE"
-                            else -> "Software"
-                        }
-                    } else {
-                        @Suppress("DEPRECATION")
-                        if (keyInfo.isInsideSecureHardware) "TEE" else "Software"
-                    }
-                    keyStore.deleteEntry(probeAlias)
-                    level
-                } catch (_: Throwable) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-                        context.packageManager.hasSystemFeature("android.hardware.hardware_keystore")) {
-                        "TEE"
-                    } else {
-                        "Software"
-                    }
-                }
+                } catch (_: Throwable) {}
             }
         } catch (_: Throwable) {
             "Software"
         }
 
-        prefs.edit().putString(KEY_CACHED_HW_LEVEL, detected).commit()
+        prefs.edit().putString(KEY_CACHED_HW_LEVEL, detected).apply()
         return detected
     }
 }

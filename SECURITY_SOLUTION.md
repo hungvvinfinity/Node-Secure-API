@@ -138,6 +138,9 @@ Theo kết quả kiểm thử toàn diện tại [FORMAL_VERIFICATION_REPORT.md]
     - `attestationSecurityLevel` $\in \{ 1 (\text{TEE}), 2 (\text{StrongBox}) \}$
     - `keymasterSecurityLevel` $\in \{ 1 (\text{TEE}), 2 (\text{StrongBox}) \}$
   - Bất kỳ chứng chỉ nào có mức bằng 0 đều bị từ chối ngay lập tức với HTTP 403 `HARDWARE_TEE_REQUIRED`.
+* **Chiến lược tối ưu hiệu năng phía Client (TEE-first):**
+  - Backend chấp nhận cả TEE (1) lẫn StrongBox (2), tuy nhiên Client demo được cấu hình **ưu tiên sử dụng TEE trước**.
+  - *Lý do hiệu năng:* StrongBox là chip vi điều khiển rời xung nhịp thấp (20–50MHz), giao tiếp qua bus I2C/SPI khiến sinh khóa attestation và ký số mất 2–5s. Trong khi đó, TEE chạy trực tiếp trên CPU chính với tập lệnh ARMv8 Crypto chỉ mất 10–40ms, giúp toàn bộ chu kỳ gọi API kết thúc trong ~1s mà vẫn giữ trọn vẹn chứng thực phần cứng Google Root CA và khóa bootloader (`deviceLocked = true`). StrongBox đóng vai trò dự phòng nếu TEE không khả dụng.
 
 ### 4.3 Loại bỏ hoàn toàn Backdoor Mock Mode (`X-Test-Mode: mock-ca`)
 * **Nguyên tắc "Zero Client-Controlled Trust Policy":**

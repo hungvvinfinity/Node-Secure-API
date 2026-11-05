@@ -8,7 +8,7 @@ Tài liệu này đặc tả chi tiết kế hoạch kỹ thuật mở rộng ki
 
 ### 1.1 Điểm nghẽn của chính sách bảo mật hiện tại
 Hệ thống hiện tại thực thi chính sách bảo mật phần cứng tuyệt đối:
-* Bắt buộc khóa nằm trong **TEE (1)** hoặc **StrongBox (2)**.
+* Bắt buộc khóa nằm trong **TEE (1)** hoặc **StrongBox (2)** (Client ưu tiên TEE trước để đạt tốc độ tối đa ~10–40ms thay vì 2–5s của chip rời StrongBox).
 * Bắt buộc chuỗi chứng chỉ phải ký ngược về **Google Hardware Attestation Root CA**.
 * Bắt buộc bootloader phải khóa (`deviceLocked = true`) và trạng thái boot chuẩn (`verifiedBootState = VERIFIED (0)`).
 
@@ -55,7 +55,7 @@ flowchart TD
 
 | Tiêu Chí | Tier 1: Hardware VIP | Tier 2: Software Protected |
 |---|---|---|
-| **Đối tượng thiết bị** | Máy có chip TEE / StrongBox, Google Root CA, bootloader khóa | Máy cũ, chip giá rẻ, unlock bootloader, không GMS |
+| **Đối tượng thiết bị** | Máy có chip TEE / StrongBox, Google Root CA, bootloader khóa (ưu tiên TEE cho tốc độ 10–40ms) | Máy cũ, chip giá rẻ, unlock bootloader, không GMS |
 | **Yêu cầu khi đăng ký** | Chuỗi chứng chỉ Google Hardware Attestation | Cặp khóa EC P-256 + Lời giải Proof of Work (PoW) |
 | **Thời hạn khóa (Lease TTL)** | **Vĩnh viễn** (gắn chặt với chip phần cứng) | **2 giờ** (sau 2h tự hủy, app tự làm mới ngầm) |
 | **Độ trễ xử lý (Latency)** | **Siêu tốc** (0ms delay bổ sung, phản hồi < 50ms) | **Tarpit Delay 3.0s** (chủ động làm chậm kết nối) |

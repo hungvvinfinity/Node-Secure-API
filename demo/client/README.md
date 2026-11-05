@@ -58,7 +58,7 @@ demo/client/
 ## 2. Các điểm bảo mật cốt lõi đã áp dụng
 
 1. **Dual-Tier Key Management ([`KeystoreManager.kt`](file:///home/hungvu/Pictures/Node-Secure-API/demo/client/src/main/kotlin/com/astrology/tarot/security/KeystoreManager.kt))**:
-   - **Tier 1 (Hardware VIP)**: Sinh cặp khóa EC P-256 (`secp256r1`) trong `AndroidKeyStore` gắn attestation challenge UTF-8, thử StrongBox trước rồi fallback TEE. Xuất chuỗi chứng chỉ X.509 DER base64 từ leaf tới Google Hardware Root.
+   - **Tier 1 (Hardware VIP)**: Sinh cặp khóa EC P-256 (`secp256r1`) trong `AndroidKeyStore` gắn attestation challenge UTF-8. **Ưu tiên TEE trước** để đạt tốc độ phản hồi cao nhất (10–40ms nhờ tập lệnh tăng tốc phần cứng ARMv8 Crypto trên CPU chính), tránh độ trễ chip vi điều khiển rời của StrongBox (2–5s); chỉ fallback sang StrongBox nếu thiết bị yêu cầu. Xuất chuỗi chứng chỉ X.509 DER base64 từ leaf tới Google Hardware Root.
    - **Tier 2 (Software Protected)**: Fallback mượt mà sang khóa EC P-256 phần mềm nếu thiết bị không hỗ trợ attestation. Xuất khóa công khai chuẩn SPKI PEM (`exportSpkiPem`).
    - Cung cấp giao diện ký số đồng nhất: `signData(canonicalString)` ký `SHA256withECDSA` sinh chuẩn DER ASN.1 Sequence `(r, s)` base64 cho cả 2 loại khóa.
 
