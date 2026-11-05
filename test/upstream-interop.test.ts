@@ -402,8 +402,9 @@ describe('Upstream Interoperability & Real Hardware Attestation Tests', () => {
       );
       const caimanPem = fs.readFileSync(caimanPemPath, 'utf8');
       const matches = caimanPem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
-      assert.ok(matches.length >= 2);
-      const peculiarIntermediate = new PeculiarX509Certificate(matches[1]!);
+      const match1 = matches[1];
+      assert.ok(match1 !== undefined);
+      const peculiarIntermediate = new PeculiarX509Certificate(match1);
 
       const info = parseProvisioningInfo(peculiarIntermediate);
       assert.ok(info !== null);
@@ -417,9 +418,10 @@ describe('Upstream Interoperability & Real Hardware Attestation Tests', () => {
       );
       const caimanPem = fs.readFileSync(caimanPemPath, 'utf8');
       const matches = caimanPem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
-      assert.ok(matches.length >= 1);
-      // Leaf cert (matches[0]) does not have Provisioning Info
-      const peculiarLeaf = new PeculiarX509Certificate(matches[0]!);
+      const match0 = matches[0];
+      assert.ok(match0 !== undefined);
+      // Leaf cert (match0) does not have Provisioning Info
+      const peculiarLeaf = new PeculiarX509Certificate(match0);
 
       const info = parseProvisioningInfo(peculiarLeaf);
       assert.equal(info, null);
