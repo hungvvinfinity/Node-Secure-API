@@ -7,7 +7,7 @@
  *
  * Subject: CN=Apple App Attestation Root CA, O=Apple Inc., ST=California
  * Validity: 2020-03-18 to 2045-03-15
- * SHA-256 Fingerprint: a93551ff81cb4e6f8b6e68f0cb18d7f8d75249e0c1f6d330d29193f41c9f0c2e
+ * SHA-256 Fingerprint: 1cb9823ba28ba6ad2d33a006941de2ae4f513ef1d4e831b9f7e0fa7b6242c932
  */
 
 export const APPLE_APP_ATTESTATION_ROOT_PEM = `-----BEGIN CERTIFICATE-----
