@@ -432,6 +432,9 @@ export class AndroidSecurityProvider implements DeviceSecurityProvider {
           packageName: matchingPackage.name,
           packageVersion: matchingPackage.version.toString(),
           provisioningMethod: validationResult.provisioningMethod,
+          ...(validationResult.provisioningInfo?.certificatesIssued !== undefined
+            ? { certificatesIssued: validationResult.provisioningInfo.certificatesIssued }
+            : {}),
           deviceLocked: hw.rootOfTrust.deviceLocked,
           verifiedBootState: 'VERIFIED',
         },
@@ -506,6 +509,9 @@ export class AndroidSecurityProvider implements DeviceSecurityProvider {
           packageName: matchingPackage!.name,
           packageVersion: matchingPackage!.version.toString(),
           provisioningMethod: validationResult.provisioningMethod,
+          ...(validationResult.provisioningInfo?.certificatesIssued !== undefined
+            ? { certificatesIssued: validationResult.provisioningInfo.certificatesIssued }
+            : {}),
           deviceLocked: hw.rootOfTrust!.deviceLocked,
           verifiedBootState: 'VERIFIED',
         },

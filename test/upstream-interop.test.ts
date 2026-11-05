@@ -13,7 +13,14 @@ import {
   parseRootsJson,
   GoogleRevocationSource
 } from '../src/platform/trust.js';
-import { validateCertificateChain } from '../src/platform/x509.js';
+import {
+  validateCertificateChain,
+  parseProvisioningInfo,
+  MAX_CERTIFICATES_ISSUED,
+  ANDROID_PROVISIONING_INFO_OID
+} from '../src/platform/x509.js';
+import { X509Certificate as PeculiarX509Certificate } from '@peculiar/x509';
+import { encode } from 'cbor-x';
 import { SecurityError } from '../src/contracts.js';
 
 function parsePemChain(pemText: string): string[] {
@@ -89,6 +96,8 @@ describe('Upstream Interoperability & Real Hardware Attestation Tests', () => {
       assert.equal(result.metadata.packageName, 'com.google.android.attestation');
       assert.equal(result.metadata.deviceLocked, true);
       assert.equal(result.metadata.verifiedBootState, 'VERIFIED');
+      assert.equal(result.metadata.provisioningMethod, 'REMOTELY_PROVISIONED');
+      assert.equal(result.metadata.certificatesIssued, 64);
     });
 
     it('rejects expired RKP intermediate at current time (2026-10-28) with 403 CERTIFICATE_EXPIRED', async () => {
@@ -177,6 +186,8 @@ describe('Upstream Interoperability & Real Hardware Attestation Tests', () => {
       assert.equal(result.metadata.packageName, 'com.google.android.attestation');
       assert.equal(result.metadata.deviceLocked, true);
       assert.equal(result.metadata.verifiedBootState, 'VERIFIED');
+      assert.equal(result.metadata.provisioningMethod, 'REMOTELY_PROVISIONED');
+      assert.equal(result.metadata.certificatesIssued, 64);
     });
   });
 
@@ -380,6 +391,123 @@ describe('Upstream Interoperability & Real Hardware Attestation Tests', () => {
           return true;
         }
       );
+    });
+  });
+
+  describe('Provisioning Info & certificatesIssued Bounds Regressions (commit 0e3ac2f)', () => {
+    it('parses real Caiman RKP certificate provisioning info with certificatesIssued = 64', () => {
+      const caimanPemPath = path.join(
+        process.cwd(),
+        'test/fixtures/upstream/caiman/sdk36/TEE_EC_RKP.pem'
+      );
+      const caimanPem = fs.readFileSync(caimanPemPath, 'utf8');
+      const matches = caimanPem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
+      assert.ok(matches.length >= 2);
+      const peculiarIntermediate = new PeculiarX509Certificate(matches[1]!);
+
+      const info = parseProvisioningInfo(peculiarIntermediate);
+      assert.ok(info !== null);
+      assert.equal(info.certificatesIssued, 64);
+    });
+
+    it('returns null if certificate does not contain Provisioning Info extension', () => {
+      const caimanPemPath = path.join(
+        process.cwd(),
+        'test/fixtures/upstream/caiman/sdk36/TEE_EC_RKP.pem'
+      );
+      const caimanPem = fs.readFileSync(caimanPemPath, 'utf8');
+      const matches = caimanPem.match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g) || [];
+      assert.ok(matches.length >= 1);
+      // Leaf cert (matches[0]) does not have Provisioning Info
+      const peculiarLeaf = new PeculiarX509Certificate(matches[0]!);
+
+      const info = parseProvisioningInfo(peculiarLeaf);
+      assert.equal(info, null);
+    });
+
+    it('clamps negative certificatesIssued to 0 (upstream negative_certificates_issued)', () => {
+      // Mock Peculiar cert with raw CBOR payload: { 1: -2147483649 }
+      // Corresponds to hex: a1013a80000000
+      const cborBytes = Buffer.from('a1013a80000000', 'hex');
+      const fakeCert = {
+        extensions: [
+          {
+            type: ANDROID_PROVISIONING_INFO_OID,
+            value: new Uint8Array(cborBytes).buffer
+          }
+        ]
+      } as unknown as PeculiarX509Certificate;
+
+      const info = parseProvisioningInfo(fakeCert);
+      assert.ok(info !== null);
+      assert.equal(info.certificatesIssued, 0);
+    });
+
+    it('clamps negative -1 to 0', () => {
+      const cborBytes = encode({ 1: -1 });
+      const fakeCert = {
+        extensions: [
+          {
+            type: ANDROID_PROVISIONING_INFO_OID,
+            value: new Uint8Array(cborBytes).buffer
+          }
+        ]
+      } as unknown as PeculiarX509Certificate;
+
+      const info = parseProvisioningInfo(fakeCert);
+      assert.ok(info !== null);
+      assert.equal(info.certificatesIssued, 0);
+    });
+
+    it('clamps out-of-bounds certificatesIssued to MAX_CERTIFICATES_ISSUED (upstream out_of_bounds_certificates_issued)', () => {
+      // Mock Peculiar cert with raw CBOR payload: { 1: 2147483648 } (Int.MAX_VALUE + 1)
+      // Corresponds to hex: a1011a80000000
+      const cborBytes = Buffer.from('a1011a80000000', 'hex');
+      const fakeCert = {
+        extensions: [
+          {
+            type: ANDROID_PROVISIONING_INFO_OID,
+            value: new Uint8Array(cborBytes).buffer
+          }
+        ]
+      } as unknown as PeculiarX509Certificate;
+
+      const info = parseProvisioningInfo(fakeCert);
+      assert.ok(info !== null);
+      assert.equal(info.certificatesIssued, MAX_CERTIFICATES_ISSUED);
+      assert.equal(info.certificatesIssued, 2147483647);
+    });
+
+    it('preserves exact Int.MAX_VALUE (2147483647)', () => {
+      const cborBytes = encode({ 1: MAX_CERTIFICATES_ISSUED });
+      const fakeCert = {
+        extensions: [
+          {
+            type: ANDROID_PROVISIONING_INFO_OID,
+            value: new Uint8Array(cborBytes).buffer
+          }
+        ]
+      } as unknown as PeculiarX509Certificate;
+
+      const info = parseProvisioningInfo(fakeCert);
+      assert.ok(info !== null);
+      assert.equal(info.certificatesIssued, 2147483647);
+    });
+
+    it('handles unsigned BigInt exceeding 64-bit integer safely by clamping', () => {
+      const cborBytes = encode({ 1: 18446744073709551615n });
+      const fakeCert = {
+        extensions: [
+          {
+            type: ANDROID_PROVISIONING_INFO_OID,
+            value: new Uint8Array(cborBytes).buffer
+          }
+        ]
+      } as unknown as PeculiarX509Certificate;
+
+      const info = parseProvisioningInfo(fakeCert);
+      assert.ok(info !== null);
+      assert.equal(info.certificatesIssued, MAX_CERTIFICATES_ISSUED);
     });
   });
 });

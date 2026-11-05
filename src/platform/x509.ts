@@ -17,6 +17,7 @@
 
 import 'reflect-metadata';
 import * as asn1 from 'asn1js';
+import { decode } from 'cbor-x';
 import {
   createPublicKey,
   KeyObject,
@@ -53,6 +54,15 @@ export type ProvisioningMethod =
   | 'REMOTELY_PROVISIONED'
   | 'UNKNOWN';
 
+export interface ProvisioningInfo {
+  certificatesIssued: number;
+}
+
+/**
+ * Maximum signed 32-bit integer for certificatesIssued (Int.MAX_VALUE).
+ */
+export const MAX_CERTIFICATES_ISSUED = 2147483647;
+
 export interface ChainValidationOptions {
   trustAnchors: string[]; // PEM strings of trust anchors
   revokedSerials?: Set<string>;
@@ -67,6 +77,7 @@ export interface ChainValidationResult {
   leafPublicKeyPem: string;
   chain: NodeX509Certificate[];
   provisioningMethod: ProvisioningMethod;
+  provisioningInfo?: ProvisioningInfo;
   trustAnchor: NodeX509Certificate;
 }
 
@@ -161,6 +172,54 @@ export function hasAttestationExtension(cert: PeculiarX509Certificate): boolean 
  */
 export function hasProvisioningInfoExtension(cert: PeculiarX509Certificate): boolean {
   return cert.extensions.some((ext) => ext.type === ANDROID_PROVISIONING_INFO_OID);
+}
+
+/**
+ * Parses the Android Provisioning Info extension (OID 1.3.6.1.4.1.11129.2.1.30).
+ * Implements bounds clamping according to official Google AOSP KeyAttestation (commit 0e3ac2f):
+ * - While RFC 8949 specifies unsigned integers up to 2^64-1, return value is bounded to 0..2^31 - 1.
+ * - If certificates_issued is negative, clamp/limit to 0.
+ * - If certificates_issued exceeds Int.MAX_VALUE (2^31 - 1), clamp/limit to 2147483647.
+ */
+export function parseProvisioningInfo(cert: PeculiarX509Certificate): ProvisioningInfo | null {
+  const ext = cert.extensions.find((e) => e.type === ANDROID_PROVISIONING_INFO_OID);
+  if (!ext || !ext.value) return null;
+
+  try {
+    const rawBytes = Buffer.from(ext.value);
+    const decoded = decode(rawBytes);
+    if (!decoded || typeof decoded !== 'object') return null;
+
+    // In CBOR map, tag 1 is certificatesIssued (key can be string '1' or number 1)
+    const map = decoded as Record<string | number, unknown>;
+    const rawIssued = map['1'] ?? map[1];
+    if (rawIssued === undefined || rawIssued === null) return null;
+
+    let value: number;
+    if (typeof rawIssued === 'bigint') {
+      if (rawIssued < 0n) {
+        value = 0;
+      } else if (rawIssued > BigInt(MAX_CERTIFICATES_ISSUED)) {
+        value = MAX_CERTIFICATES_ISSUED;
+      } else {
+        value = Number(rawIssued);
+      }
+    } else if (typeof rawIssued === 'number') {
+      if (rawIssued < 0) {
+        value = 0;
+      } else if (rawIssued > MAX_CERTIFICATES_ISSUED) {
+        value = MAX_CERTIFICATES_ISSUED;
+      } else {
+        value = Math.trunc(rawIssued);
+      }
+    } else {
+      return null;
+    }
+
+    return { certificatesIssued: value };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -413,12 +472,17 @@ export function validateCertificateChain(
 
   const leafPublicKeyPem = exportSpkiPem(leafCert.publicKey);
 
+  const provisioningInfo = (provisioningMethod === 'REMOTELY_PROVISIONED' && peculiarCerts.length >= 2)
+    ? parseProvisioningInfo(peculiarCerts[1]) ?? undefined
+    : undefined;
+
   return {
     leafCert,
     leafPeculiarCert,
     leafPublicKeyPem,
     chain: nodeCerts,
     provisioningMethod,
+    ...(provisioningInfo ? { provisioningInfo } : {}),
     trustAnchor: rootCert,
   };
 }

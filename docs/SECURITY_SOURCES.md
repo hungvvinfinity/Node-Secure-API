@@ -1,10 +1,10 @@
 # Nguồn bảo mật và quy trình cập nhật
 
-Đã truy xuất trực tiếp: **2026-10-28 UTC** (2026-10-29 tại Việt Nam). Các đường dẫn dưới đây là nguồn sơ cấp. Cập nhật kiến thức là một bước của mỗi phase/release, không phải lời hứa code sẽ tự theo mọi thay đổi tương lai.
+Đã truy xuất trực tiếp: **2026-11-05 UTC** (2026-11-05 tại Việt Nam). Các đường dẫn dưới đây là nguồn sơ cấp. Cập nhật kiến thức là một bước của mỗi phase/release, không phải lời hứa code sẽ tự theo mọi thay đổi tương lai.
 
 | Nguồn | Phiên bản / nội dung đối chiếu | Ảnh hưởng triển khai |
 |---|---|---|
-| [android/keyattestation](https://github.com/android/keyattestation) | main commit [34652d3df68b8d6887a6670b00eb0856090dae6d](https://github.com/android/keyattestation/commit/34652d3df68b8d6887a6670b00eb0856090dae6d), committed 2026-10-26; README, verifier, constraints, provider | Xác minh ở server; app identity; challenge; chain; revocation. Thư viện gốc là Kotlin, backend Node dùng implementation riêng được test, không import Kotlin giả. |
+| [android/keyattestation](https://github.com/android/keyattestation) | main commit [0e3ac2fdd54799d779e1979a96fbcba0361b2089](https://github.com/android/keyattestation/commit/0e3ac2fdd54799d779e1979a96fbcba0361b2089), committed 2026-10-30; README, verifier, constraints, bounds test certificates_issued | Xác minh ở server; app identity; challenge; chain; revocation; bounds clamping certificates_issued (0..2^31-1). Thư viện gốc là Kotlin, backend Node dùng implementation riêng được test, không import Kotlin giả. |
 | [Android Developers: key attestation](https://developer.android.com/privacy-and-security/security-key-attestation) | Hướng dẫn chain, extension và root rotation | EC root mới bắt đầu ký từ 2026-02-01; không giả định attestation luôn ở leaf. Chọn occurrence đầu tiên từ root; không tin descendant tự nối. |
 | [AOSP: attestation schema](https://source.android.com/docs/security/features/keystore/attestation) | KeyMint/Keymaster KeyDescription, AuthorizationList, RootOfTrust, ApplicationId | Parse EXPLICIT ASN.1 tags chính xác; rootOfTrust phải hardware-enforced; package version giữ BigInt. |
 | [Google roots](https://android.googleapis.com/attestation/root) | Endpoint JSON chính thức | Trust chỉ từ snapshot server quản lý; hỗ trợ root RSA và EC. Không lấy CA từ client. |
