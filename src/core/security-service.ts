@@ -303,6 +303,17 @@ export class SecurityService {
       params.rawBody
     );
 
+    console.log('[DEBUG AUTHENTICATE]', {
+      deviceId: device.deviceId,
+      platform: device.platform,
+      tier: device.tier,
+      storedSignCount: device.signCount,
+      storedLastSequence: device.lastSequence,
+      canonicalString: canonical.toString('utf8'),
+      bodySha256: crypto.createHash('sha256').update(params.rawBody).digest('hex'),
+      rawBodyLength: params.rawBody.length,
+    });
+
     // 8. Verify signature BEFORE atomic sequence advance (prevents burning sequence on invalid signature)
     const provider = this.getProvider(device.platform);
     let verifyResult: { signCount?: number } = {};

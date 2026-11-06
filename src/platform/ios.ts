@@ -739,17 +739,33 @@ export class IOSSecurityProvider implements DeviceSecurityProvider {
     }
 
     // Signature verification over single composite hash:
-    // crypto.verify('sha256', concat(authenticatorData, SHA256(canonical)), key, signature)
+    // Apple App Attest official spec: nonce = SHA256(concat(authenticatorData, SHA256(canonical)))
+    // Hardware Secure Enclave generates raw ECDSA signature over the 32-byte digest (verified via crypto.verify(null, nonce)).
     const keyObject = getP256Key(device.publicKeyPem);
     const clientDataHash = crypto.createHash('sha256').update(proof.canonical).digest();
     const composite = Buffer.concat([authenticatorData, clientDataHash]);
+    const nonce = crypto.createHash('sha256').update(composite).digest();
+
+    console.log('[DEBUG IOS VERIFY INPUTS]', {
+      counter,
+      deviceSignCount: device.signCount,
+      authDataLen: authenticatorData.length,
+      flags: authenticatorData[32],
+      signatureLen: signature.length,
+      clientDataHashHex: clientDataHash.toString('hex'),
+      nonceHex: nonce.toString('hex'),
+      canonicalUtf8: proof.canonical.toString('utf8'),
+    });
 
     let valid = false;
     try {
-      valid = crypto.verify('sha256', composite, keyObject, signature);
-    } catch {
+      valid = crypto.verify(null, nonce, keyObject, signature);
+    } catch (err) {
+      console.error('[DEBUG IOS VERIFY ERROR]', err);
       throw new SecurityError('INVALID_SIGNATURE', 401);
     }
+
+    console.log('[DEBUG IOS VERIFY RESULT]', { valid });
 
     if (!valid) {
       throw new SecurityError('INVALID_SIGNATURE', 401);

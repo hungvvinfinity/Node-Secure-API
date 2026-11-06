@@ -180,10 +180,11 @@ Client iOS **không ký trực tiếp** lên canonical string. Thay vào đó, c
 
 $$1.\quad \text{clientDataHash} = \text{SHA-256}(\text{canonicalString})$$
 $$2.\quad \text{composite} = \text{authenticatorData} \mathbin{\Vert} \text{clientDataHash}$$
-$$3.\quad \text{Verify: } \text{ECDSA-P256-Verify}(\text{publicKey}, \text{composite}, \text{signature}) == \text{true}$$
+$$3.\quad \text{nonce} = \text{SHA-256}(\text{composite})$$
+$$4.\quad \text{Verify: } \text{ECDSA-P256-Verify}(\text{publicKey}, \text{nonce}, \text{signature}) == \text{true}$$
 
-> [!CAUTION]
-> **Lỗi thường gặp ở client/test:** Băm `clientDataHash` 2 lần hoặc băm thêm một lần nữa chuỗi `composite` trước khi ký sẽ làm sai lệch chữ ký và bị server từ chối với lỗi `401 INVALID_SIGNATURE`.
+> [!NOTE]
+> **Đặc tả Apple App Attest:** Apple Secure Enclave thực hiện ký ECDSA trực tiếp trên mảng 32 bytes $\text{nonce} = \text{SHA-256}(\text{composite})$ (theo mục *"Verify the assertion"* trong tài liệu Apple [Validating Apps That Connect to Your Server](https://developer.apple.com/documentation/devicecheck/validating-apps-that-connect-to-your-server)). Phía Node.js thực thi thẩm tra qua `crypto.verify(null, nonce, keyObject, signature)` để đảm bảo khớp chính xác với phần cứng Secure Enclave.
 
 ---
 
@@ -207,8 +208,8 @@ sequenceDiagram
     Server->>Server: 6. Kiểm tra độ dài nghiêm ngặt: nếu ED=0 thì length === 37
     Server->>Server: 7. Nếu ED=1, parse CBOR Map App Properties
     Server->>Server: 8. Đọc counter (33..36) uint32BE, kiểm tra counter > stored.signCount
-    Server->>Server: 9. Tính composite = [authData || SHA256(canonical)]
-    Server->>Server: 10. Xác thực chữ ký ECDSA P-256 với leaf public key
+    Server->>Server: 9. Tính composite = [authData || SHA256(canonical)] & nonce = SHA256(composite)
+    Server->>Server: 10. Xác thực chữ ký ECDSA P-256 trên nonce với leaf public key
     Server->>Redis: 11. Atomic Lua CAS: Cập nhật signCount & Sequence
     Redis-->>Server: OK (1 winner)
     Server-->>Client: 200 OK (Thành công)

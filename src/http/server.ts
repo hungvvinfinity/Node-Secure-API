@@ -426,6 +426,18 @@ export function createServer(options: CreateServerOptions): Server {
         const signature = req.headers['x-signature'];
         const assertion = req.headers['x-assertion'];
 
+        console.log('[DEBUG HTTP REQUEST]', {
+          method,
+          rawUrl,
+          pathname,
+          deviceId,
+          timestamp,
+          sequence,
+          hasAssertion: !!assertion,
+          rawBodyLength: rawBody.length,
+          rawBodyString: rawBody.toString('utf8'),
+        });
+
         if (
           !deviceId ||
           !timestamp ||
@@ -505,6 +517,7 @@ export function createServer(options: CreateServerOptions): Server {
       // 6. Any other unmatched routes
       sendJson(res, 404, { error: 'NOT_FOUND', message: 'Route not found' });
     } catch (err) {
+      console.error('[DEBUG HTTP ERROR]', err);
       if (err instanceof SecurityError && err.status === 413) {
         res.setHeader('Connection', 'close');
         res.once('finish', () => req.destroy());

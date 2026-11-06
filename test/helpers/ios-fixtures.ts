@@ -600,14 +600,15 @@ export function createIosAssertion(options: IosAssertionOptions): { assertionBas
   const clientDataHash = crypto.createHash('sha256').update(options.canonicalBuffer).digest();
 
   // Signature input composite: concat(authenticatorData, SHA256(canonical))
-  let composite = Buffer.concat([authenticatorData, clientDataHash]);
+  const composite = Buffer.concat([authenticatorData, clientDataHash]);
+  let nonce = crypto.createHash('sha256').update(composite).digest();
 
   if (options.doubleHash) {
-    // Negative test: incorrectly hashing clientDataHash again or hashing composite
-    composite = crypto.createHash('sha256').update(composite).digest();
+    // Negative test: incorrectly hashing nonce again
+    nonce = crypto.createHash('sha256').update(nonce).digest();
   }
 
-  let signatureDer = crypto.sign('sha256', composite, crypto.createPrivateKey(options.privateKeyPem));
+  let signatureDer = crypto.sign(null, nonce, crypto.createPrivateKey(options.privateKeyPem));
 
   if (options.corruptSignature) {
     const corrupt = Buffer.from(signatureDer);
