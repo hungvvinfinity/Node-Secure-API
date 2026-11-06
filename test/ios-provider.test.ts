@@ -11,7 +11,8 @@ import { buildCanonicalBuffer } from '../src/core/canonical.js';
 import {
   createIosAttestationFixture,
   createIosAssertion,
-  createAppleAttestRootCA
+  createAppleAttestRootCA,
+  encodeCbor
 } from './helpers/ios-fixtures.js';
 import { checkRedisAvailable } from './helpers/redis-probe.js';
 
@@ -889,7 +890,31 @@ describe('IOSSecurityProvider (Unit & Cryptographic Invariants)', () => {
       );
     });
 
-    it('rejects assertion with AT flag set (0x40) with 401 UNEXPECTED_ATTESTED_CREDENTIAL_DATA', async () => {
+    it('accepts assertion with AT flag set (0x40) when length is 37 bytes', async () => {
+      const fixture = await createIosAttestationFixture({ appId, now });
+      const provider = new IOSSecurityProvider({
+        trustAnchors: [fixture.rootCertPem],
+        appId,
+        receiptVerifier: fixture.receiptVerifier,
+        now: () => now
+      });
+
+      const device = createVerifiedIosDevice(fixture, { signCount: 0 });
+
+      const canonical = buildCanonicalBuffer(String(now), '1', 'POST', '/api/tarot/read', Buffer.from('{}'));
+      const assertionWithAt = createIosAssertion({
+        appId,
+        privateKeyPem: fixture.leafPrivateKeyPem,
+        canonicalBuffer: canonical,
+        counter: 1,
+        flags: 0x40 // iOS DCAppAttestService sets AT flag in assertions
+      });
+
+      const result = await provider.verifyRequest(device, { canonical, assertion: assertionWithAt.assertionBase64 });
+      assert.equal(result.signCount, 1);
+    });
+
+    it('rejects assertion with AT flag set (0x40) when length > 37 bytes and ED is clear with 401 INVALID_AUTHENTICATOR_DATA_LENGTH', async () => {
       const fixture = await createIosAttestationFixture({ appId, now });
       const provider = new IOSSecurityProvider({
         trustAnchors: [fixture.rootCertPem],
@@ -906,15 +931,221 @@ describe('IOSSecurityProvider (Unit & Cryptographic Invariants)', () => {
         privateKeyPem: fixture.leafPrivateKeyPem,
         canonicalBuffer: canonical,
         counter: 1,
-        flags: 0x40 // AT flag illegally set in assertion!
+        flags: 0x40, // AT flag set, ED clear
+        extraAuthData: Buffer.alloc(16, 0xaa) // Extra credential data attached (> 37 bytes)
       });
 
       await assert.rejects(
         () => provider.verifyRequest(device, { canonical, assertion: rogueAssertion.assertionBase64 }),
         (err: unknown) => {
           assert.ok(err instanceof SecurityError);
-          assert.equal(err.code, 'UNEXPECTED_ATTESTED_CREDENTIAL_DATA');
+          assert.equal(err.code, 'INVALID_AUTHENTICATOR_DATA_LENGTH');
           assert.equal(err.status, 401);
+          return true;
+        }
+      );
+    });
+
+    it('rejects assertion with unsupported flags individually (0x02, 0x08, 0x10, 0x20) and combined with AT with 401 UNSUPPORTED_AUTHENTICATOR_FLAGS', async () => {
+      const fixture = await createIosAttestationFixture({ appId, now });
+      const provider = new IOSSecurityProvider({
+        trustAnchors: [fixture.rootCertPem],
+        appId,
+        receiptVerifier: fixture.receiptVerifier,
+        now: () => now
+      });
+
+      const device = createVerifiedIosDevice(fixture, { signCount: 0 });
+      const canonical = buildCanonicalBuffer(String(now), '1', 'POST', '/api/tarot/read', Buffer.from('{}'));
+
+      const badFlags = [
+        0x02, // RFU bit 1
+        0x08, // WebAuthn L3 BE bit 3
+        0x10, // WebAuthn L3 BS bit 4
+        0x20, // RFU bit 5
+        0x40 | 0x02, // AT + RFU bit 1
+        0x40 | 0x08, // AT + BE bit 3
+        0x40 | 0x10, // AT + BS bit 4
+        0x40 | 0x20  // AT + RFU bit 5
+      ];
+
+      for (const flags of badFlags) {
+        const rogueAssertion = createIosAssertion({
+          appId,
+          privateKeyPem: fixture.leafPrivateKeyPem,
+          canonicalBuffer: canonical,
+          counter: 1,
+          flags
+        });
+
+        await assert.rejects(
+          () => provider.verifyRequest(device, { canonical, assertion: rogueAssertion.assertionBase64 }),
+          (err: unknown) => {
+            assert.ok(err instanceof SecurityError, `Expected SecurityError for flags 0x${flags.toString(16)}`);
+            assert.equal(err.code, 'UNSUPPORTED_AUTHENTICATOR_FLAGS');
+            assert.equal(err.status, 401);
+            return true;
+          }
+        );
+      }
+    });
+
+    it('accepts assertion with AT + ED flags set (0xc0) and valid CBOR extension map', async () => {
+      const fixture = await createIosAttestationFixture({ appId, now });
+      const provider = new IOSSecurityProvider({
+        trustAnchors: [fixture.rootCertPem],
+        appId,
+        receiptVerifier: fixture.receiptVerifier,
+        now: () => now
+      });
+
+      const device = createVerifiedIosDevice(fixture, { signCount: 0 });
+      const canonical = buildCanonicalBuffer(String(now), '1', 'POST', '/api/tarot/read', Buffer.from('{}'));
+
+      // Extension data: empty CBOR map ({})
+      const emptyExtMapBytes = encodeCbor(new Map());
+      const assertionWithAtAndEd = createIosAssertion({
+        appId,
+        privateKeyPem: fixture.leafPrivateKeyPem,
+        canonicalBuffer: canonical,
+        counter: 1,
+        flags: 0x40 | 0x80, // AT (0x40) + ED (0x80)
+        extraAuthData: emptyExtMapBytes
+      });
+
+      const result = await provider.verifyRequest(device, { canonical, assertion: assertionWithAtAndEd.assertionBase64 });
+      assert.equal(result.signCount, 1);
+    });
+
+    it('rejects assertion with AT + ED flags set (0xc0) when extension data is missing with 401 MISSING_EXTENSION_DATA', async () => {
+      const fixture = await createIosAttestationFixture({ appId, now });
+      const provider = new IOSSecurityProvider({
+        trustAnchors: [fixture.rootCertPem],
+        appId,
+        receiptVerifier: fixture.receiptVerifier,
+        now: () => now
+      });
+
+      const device = createVerifiedIosDevice(fixture, { signCount: 0 });
+      const canonical = buildCanonicalBuffer(String(now), '1', 'POST', '/api/tarot/read', Buffer.from('{}'));
+
+      const assertionMissingExt = createIosAssertion({
+        appId,
+        privateKeyPem: fixture.leafPrivateKeyPem,
+        canonicalBuffer: canonical,
+        counter: 1,
+        flags: 0x40 | 0x80 // ED set but no extra bytes (length === 37)
+      });
+
+      await assert.rejects(
+        () => provider.verifyRequest(device, { canonical, assertion: assertionMissingExt.assertionBase64 }),
+        (err: unknown) => {
+          assert.ok(err instanceof SecurityError);
+          assert.equal(err.code, 'MISSING_EXTENSION_DATA');
+          assert.equal(err.status, 401);
+          return true;
+        }
+      );
+    });
+
+    it('rejects assertion with AT + ED flags set (0xc0) when extension data is not a CBOR map with 401 INVALID_EXTENSION_DATA', async () => {
+      const fixture = await createIosAttestationFixture({ appId, now });
+      const provider = new IOSSecurityProvider({
+        trustAnchors: [fixture.rootCertPem],
+        appId,
+        receiptVerifier: fixture.receiptVerifier,
+        now: () => now
+      });
+
+      const device = createVerifiedIosDevice(fixture, { signCount: 0 });
+      const canonical = buildCanonicalBuffer(String(now), '1', 'POST', '/api/tarot/read', Buffer.from('{}'));
+
+      // Extension data: CBOR array instead of map
+      const nonMapExtBytes = encodeCbor([1, 2, 3]);
+      const assertionNonMap = createIosAssertion({
+        appId,
+        privateKeyPem: fixture.leafPrivateKeyPem,
+        canonicalBuffer: canonical,
+        counter: 1,
+        flags: 0x40 | 0x80,
+        extraAuthData: nonMapExtBytes
+      });
+
+      await assert.rejects(
+        () => provider.verifyRequest(device, { canonical, assertion: assertionNonMap.assertionBase64 }),
+        (err: unknown) => {
+          assert.ok(err instanceof SecurityError);
+          assert.equal(err.code, 'INVALID_EXTENSION_DATA');
+          assert.equal(err.status, 401);
+          return true;
+        }
+      );
+    });
+
+    it('rejects assertion with AT + ED flags set (0xc0) when extension data has multiple CBOR items with 401 INVALID_EXTENSION_DATA', async () => {
+      const fixture = await createIosAttestationFixture({ appId, now });
+      const provider = new IOSSecurityProvider({
+        trustAnchors: [fixture.rootCertPem],
+        appId,
+        receiptVerifier: fixture.receiptVerifier,
+        now: () => now
+      });
+
+      const device = createVerifiedIosDevice(fixture, { signCount: 0 });
+      const canonical = buildCanonicalBuffer(String(now), '1', 'POST', '/api/tarot/read', Buffer.from('{}'));
+
+      // Extension data: two concatenated CBOR maps
+      const multiExtBytes = Buffer.concat([encodeCbor(new Map()), encodeCbor(new Map())]);
+      const assertionMulti = createIosAssertion({
+        appId,
+        privateKeyPem: fixture.leafPrivateKeyPem,
+        canonicalBuffer: canonical,
+        counter: 1,
+        flags: 0x40 | 0x80,
+        extraAuthData: multiExtBytes
+      });
+
+      await assert.rejects(
+        () => provider.verifyRequest(device, { canonical, assertion: assertionMulti.assertionBase64 }),
+        (err: unknown) => {
+          assert.ok(err instanceof SecurityError);
+          assert.equal(err.code, 'INVALID_EXTENSION_DATA');
+          assert.equal(err.status, 401);
+          return true;
+        }
+      );
+    });
+
+    it('rejects assertion with AT + ED flags set (0xc0) when requireAppProperties is true but extension map is empty with 403 MISSING_APP_PROPERTIES', async () => {
+      const fixture = await createIosAttestationFixture({ appId, now });
+      const provider = new IOSSecurityProvider({
+        trustAnchors: [fixture.rootCertPem],
+        appId,
+        receiptVerifier: fixture.receiptVerifier,
+        requireAppProperties: true, // Requires validationCategory and bundleVersion
+        now: () => now
+      });
+
+      const device = createVerifiedIosDevice(fixture, { signCount: 0 });
+      const canonical = buildCanonicalBuffer(String(now), '1', 'POST', '/api/tarot/read', Buffer.from('{}'));
+
+      // Empty map
+      const emptyExtMapBytes = encodeCbor(new Map());
+      const assertionEmptyExt = createIosAssertion({
+        appId,
+        privateKeyPem: fixture.leafPrivateKeyPem,
+        canonicalBuffer: canonical,
+        counter: 1,
+        flags: 0x40 | 0x80,
+        extraAuthData: emptyExtMapBytes
+      });
+
+      await assert.rejects(
+        () => provider.verifyRequest(device, { canonical, assertion: assertionEmptyExt.assertionBase64 }),
+        (err: unknown) => {
+          assert.ok(err instanceof SecurityError);
+          assert.equal(err.code, 'MISSING_APP_PROPERTIES');
+          assert.equal(err.status, 403);
           return true;
         }
       );

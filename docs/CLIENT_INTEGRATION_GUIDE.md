@@ -157,7 +157,7 @@ Khi dịch vụ backend hoặc cụm Redis khởi động lại, server áp dụ
 ```json
 {
   "challenge": "a1b2c3d4e5f67890123456789abcdef0123456789abcdef0123456789abcdef0",
-  "keyId": "Base64(utf8(keyId))",
+  "keyId": "<chuỗi Base64 32-bytes nguyên bản từ DCAppAttestService.generateKey>",
   "attestationObject": "Base64(attestationObject)"
 }
 ```
@@ -970,6 +970,11 @@ class RetryHelper(private val api: ApiClient) {
 
 Trên iOS, Apple App Attest sử dụng Secure Enclave để chứng thực tính toàn vẹn của ứng dụng.
 
+> [!TIP]
+> **Mã nguồn Drop-in hoàn chỉnh**: Xem mã nguồn client đầy đủ, zero-dependency, tự động chuyển đổi giữa **Xcode Simulator** (Mock P-256) và **iPhone Thật** (Secure Enclave), hỗ trợ lưu trữ **iOS Keychain** bền vững tại [`demo/swift/AppAttestClient.swift`](../demo/swift/AppAttestClient.swift) kèm hướng dẫn tại [`demo/swift/README.md`](../demo/swift/README.md).
+
+Dưới đây là kiến trúc client Swift tinh gọn mẫu:
+
 ```swift
 import DeviceCheck
 import Foundation
@@ -998,6 +1003,15 @@ actor AppAttestClient {
         self.baseURL = baseURL
     }
 
+    private func endpointURL(path: String) -> URL {
+        let cleanPath = path.hasPrefix("/") ? String(path.dropFirst()) : path
+        var url = baseURL
+        for segment in cleanPath.split(separator: "/") {
+            url.appendPathComponent(String(segment))
+        }
+        return url
+    }
+
     private func sha256Hex(_ data: Data) -> String {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
@@ -1010,9 +1024,10 @@ actor AppAttestClient {
         guard service.isSupported else { throw NSError(domain: "AppAttest", code: 1, userInfo: [NSLocalizedDescriptionKey: "App Attest not supported"]) }
 
         // 1. Request challenge
-        var chalReq = URLRequest(url: baseURL.appendingPathComponent("api/auth/challenge"))
+        let challengeURL = endpointURL(path: "api/auth/challenge")
+        var chalReq = URLRequest(url: challengeURL)
         chalReq.httpMethod = "POST"
-        chalReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        chalReq.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         chalReq.httpBody = try JSONSerialization.data(withJSONObject: ["platform": "ios"])
         let (chalData, _) = try await URLSession.shared.data(for: chalReq)
         let chalDto = try JSONDecoder().decode(ChallengeDTO.self, from: chalData)
@@ -1026,15 +1041,16 @@ actor AppAttestClient {
         let challengeHash = Data(SHA256.hash(data: Data(chalDto.challenge.utf8)))
         let attestation = try await service.attestKey(kId, clientDataHash: challengeHash)
 
-        // 3. Register with backend
+        // 3. Register with backend (kId do Apple sinh ra đã là chuỗi Base64 chuẩn của 32 bytes SHA256)
         let payload: [String: Any] = [
             "challenge": chalDto.challenge,
-            "keyId": Data(kId.utf8).base64EncodedString(),
+            "keyId": kId,
             "attestationObject": attestation.base64EncodedString()
         ]
-        var regReq = URLRequest(url: baseURL.appendingPathComponent("api/auth/register-device"))
+        let regURL = endpointURL(path: "api/auth/register-device")
+        var regReq = URLRequest(url: regURL)
         regReq.httpMethod = "POST"
-        regReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        regReq.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         regReq.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (regData, _) = try await URLSession.shared.data(for: regReq)
         let regDto = try JSONDecoder().decode(RegistrationDTO.self, from: regData)
@@ -1045,27 +1061,53 @@ actor AppAttestClient {
         return regDto.deviceId
     }
 
-    func executeRequest(path: String, body: Data, idempotencyKey: String = UUID().uuidString) async throws -> (Data, HTTPURLResponse) {
+    func executeRequest(path: String, method: String = "POST", body: Data = Data(), idempotencyKey: String = UUID().uuidString) async throws -> (Data, HTTPURLResponse) {
         guard let dId = deviceId, let kId = keyId else {
             throw NSError(domain: "Auth", code: 401, userInfo: [NSLocalizedDescriptionKey: "Unregistered"])
         }
         guard sequence < Int64.max else { throw NSError(domain: "Sequence", code: 400) }
 
+        // Snapshot sequence trước suspension point để tránh race condition giữa các request đồng thời
         sequence += 1
-        // Ghi bền vững sequence xuống Keychain trước khi gửi ra wire
+        let currentSeq = sequence
+        let seqString = String(currentSeq)
+        // Ghi bền vững sequence xuống Keychain trước khi gửi ra wire (xem demo/swift/AppAttestClient.swift)
 
-        let timestamp = String(Int64(Date().timeIntervalSince1970 * 1000) + clockOffsetMs)
-        let canonical = makeCanonical(timestamp: timestamp, sequence: String(sequence), method: "POST", target: path, rawBody: body)
+        // Tính timestamp đã được bù lệch đồng hồ (Clock Offset Compensation)
+        let adjustedTimestampMs = Int64(Date().timeIntervalSince1970 * 1000) + clockOffsetMs
+        let timestamp = String(adjustedTimestampMs)
+
+        // Chuẩn hóa method
+        let normalizedMethod = method.uppercased()
+
+        // An toàn khi path có query parameters: dùng URL(string:relativeTo:) thay vì appendingPathComponent
+        guard let fullURL = URL(string: path, relativeTo: baseURL) else {
+            throw NSError(domain: "URL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid Path"])
+        }
+
+        let target: String
+        if let components = URLComponents(url: fullURL, resolvingAgainstBaseURL: true) {
+            let p = components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath
+            if let q = components.percentEncodedQuery, !q.isEmpty {
+                target = "\(p)?\(q)"
+            } else {
+                target = p
+            }
+        } else {
+            target = path.hasPrefix("/") ? path : "/\(path)"
+        }
+
+        let canonical = makeCanonical(timestamp: timestamp, sequence: seqString, method: normalizedMethod, target: target, rawBody: body)
         let clientDataHash = Data(SHA256.hash(data: canonical))
         let assertion = try await service.generateAssertion(kId, clientDataHash: clientDataHash)
 
-        var request = URLRequest(url: baseURL.appendingPathComponent(path))
-        request.httpMethod = "POST"
+        var request = URLRequest(url: fullURL)
+        request.httpMethod = normalizedMethod
         request.httpBody = body
         request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
         request.setValue(dId, forHTTPHeaderField: "X-Device-Id")
         request.setValue(timestamp, forHTTPHeaderField: "X-Timestamp")
-        request.setValue(String(sequence), forHTTPHeaderField: "X-Sequence")
+        request.setValue(seqString, forHTTPHeaderField: "X-Sequence")
         request.setValue(assertion.base64EncodedString(), forHTTPHeaderField: "X-Assertion")
         request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
 
@@ -1094,7 +1136,6 @@ actor AppAttestClient {
 | **400** | `KEY_ID_MISMATCH` | (iOS) `keyId` không khớp SHA-256 của uncompressed EC public key trong attestation. | Kiểm tra lại logic sinh `keyId = SHA256(leafPublicKeyPoint).base64`. |
 | **400** | `ATTESTED_CREDENTIAL_DATA_FLAG_MISSING` | (iOS) Cờ AT (0x40) trong `authData` bị thiếu khi đăng ký. | Đảm bảo sử dụng đối tượng attestation sinh ra từ hàm `attestKey`. |
 | **400** | `INVALID_SIGN_COUNT` | (iOS) `signCount != 0` khi đăng ký; hoặc (Nghiệp vụ) `signCount` không phải số nguyên $1 \le x \le 2^{32}-1$. | Reset hoặc tạo mới cặp khóa trên iOS nếu `signCount` ban đầu không hợp lệ. |
-| **400** | `AAGUID_MISMATCH` | (iOS) AAGUID không khớp môi trường App Attest (`"appattest"` trên production, `"appattestdevelop"` trên test). | Kiểm tra môi trường build ứng dụng (App Store vs Development). |
 | **400** | `INVALID_SEQUENCE` | Sequence không đúng định dạng decimal (`^[1-9]\d{0,18}$`), chứa số 0 đầu, số âm, hoặc vượt quá signed int64 MAX ($2^{63}-1$). | Kiểm tra `AtomicSequenceGenerator`, đảm bảo sequence là số nguyên dương strictly increasing dạng chuỗi decimal. |
 | **400** | `INVALID_TIMESTAMP` | Timestamp không đúng định dạng decimal nguyên dương milliseconds (`^[1-9]\d{0,15}$`). | Sử dụng Unix epoch milliseconds nguyên bản dạng chuỗi số. |
 | **400** | `REQUEST_ABORTED` | Kết nối bị ngắt đột ngột giữa chừng từ phía client trong khi truyền tải body. | Kiểm tra độ ổn định kết nối mạng, tránh ngắt stream sớm. |
@@ -1110,7 +1151,7 @@ actor AppAttestClient {
 | **401** | `MALFORMED_DER_SIGNATURE` / `INVALID_SIGNATURE_LENGTH` | Chữ ký Android sai độ dài hoặc không đúng cấu trúc DER ASN.1 `SEQUENCE { r, s }`. | Bắt buộc định dạng DER ASN.1 chuẩn `(r, s)` được Base64 NO_WRAP. |
 | **401** | `SIGN_COUNT_NOT_INCREASED` / `COUNTER_ROLLBACK` | (iOS) `signCount` trong assertion không lớn hơn `signCount` đã lưu hoặc bị giảm. | Khởi động luồng re-attestation tạo cặp khóa mới theo chính sách Apple. |
 | **401** | `ASSERTION_TOO_LARGE` | (iOS) Header `X-Assertion` vượt quá hạn mức 8KB. | Kiểm tra lại đối tượng assertion CBOR được sinh ra từ hệ điều hành. |
-| **401** | `UNEXPECTED_ATTESTED_CREDENTIAL_DATA` | (iOS) Cờ AT xuất hiện trong assertion gọi API nghiệp vụ (chỉ được phép khi đăng ký). | Sử dụng đúng hàm `generateAssertion` thay vì gửi lại `attestationObject`. |
+| **401** | `INVALID_AUTHENTICATOR_DATA_LENGTH` | (iOS) Kích thước `authenticatorData` sai định dạng (khi cờ ED (0x80) tắt, độ dài phải đúng 37 bytes; từ chối mọi assertion kèm dữ liệu credential trái phép > 37 bytes). | Kiểm tra dữ liệu assertion từ `DCAppAttestService.generateAssertion`. |
 | **401** | `RP_ID_MISMATCH` | (iOS) `rpIdHash` trong authData không khớp với `appId` (`TEAMID.bundleId`). | Kiểm tra cấu hình App Attest entitlements và App ID trên Apple Developer portal. |
 | **401** | `DEVICE_LEASE_EXPIRED` | *(Chỉ thuộc Software Tier cũ)* Lease 2 giờ đã hết hạn. | Hardware VIP có lease vĩnh viễn (`expiresAt = null`), không phát sinh mã lỗi này. |
 | **403** | `HARDWARE_TEE_REQUIRED` | Khóa KeyMint có cấp độ an ninh Software (0) thay vì TEE (1) hoặc StrongBox (2). | Thiết bị không đạt chuẩn phần cứng hoặc chạy trong môi trường giả lập không được hỗ trợ. |
@@ -1125,6 +1166,7 @@ actor AppAttestClient {
 | **403** | `CERTIFICATE_REVOKED` | Chứng chỉ nằm trong danh sách thu hồi CRL của Google hoặc Apple. | Khóa phần cứng của model thiết bị đã bị lộ lọt và nhà sản xuất đã thu hồi. |
 | **403** | `CERTIFICATE_EXPIRED` | Chứng chỉ trung gian hoặc chứng chỉ leaf trong chuỗi đã hết hạn. | Kiểm tra đồng hồ hệ thống hoặc chuỗi chứng chỉ thiết bị. |
 | **403** | `INVALID_APP_ATTEST_RECEIPT` / `RECEIPT_EXPIRED` / `RECEIPT_APP_ID_MISMATCH` | Biên lai Apple App Attest không hợp lệ, hết hạn hoặc sai App ID. | Thẩm tra biên lai Apple App Attest thất bại; yêu cầu khởi tạo lại khóa mới. |
+| **403** | `AAGUID_MISMATCH` | (iOS) AAGUID không khớp môi trường App Attest (`"appattest"` trên production, `"appattestdevelop"` trên test). | Kiểm tra môi trường build ứng dụng (App Store vs Development). |
 | **403** | `BUNDLE_VERSION_TOO_LOW` | (iOS) Bundle version trong App Properties nhỏ hơn phiên bản yêu cầu. | Yêu cầu người dùng cập nhật ứng dụng iOS từ App Store. |
 | **405** | `METHOD_NOT_ALLOWED` | Phương thức HTTP không được hỗ trợ (ví dụ dùng `GET` vào `/api/auth/challenge`). | Tuân thủ đặc tả: Sử dụng phương thức `POST` cho các control endpoints. |
 | **409** | `DEVICE_ALREADY_REGISTERED` | Thiết bị (`deviceId`) đã được đăng ký trước đó (vi phạm cờ `createDeviceNX`). | Không đăng ký đè; giữ nguyên cặp khóa hiện tại để gọi API nghiệp vụ. |
@@ -1286,7 +1328,7 @@ Ma trận kiểm thử dưới đây bao quát **100% các điều kiện biên,
 | **TC-IOS-REG-04** | iOS App Attest | Chặn sai lệch App ID / Team ID (RP ID Mismatch) | Gửi `authData` có `rpIdHash` khác với `SHA256(appId)` cấu hình server | **HTTP 401 Unauthorized**<br>`{ "error": "RP_ID_MISMATCH" }` | Đảm bảo khóa sinh từ đúng ứng dụng và Team ID của doanh nghiệp. |
 | **TC-IOS-REG-05** | iOS App Attest | Bắt buộc cờ Attested Credential Data (AT flag) | Gửi `authData` có byte cờ flags không bật bit AT (0x40) khi đăng ký | **HTTP 400 Bad Request**<br>`{ "error": "ATTESTED_CREDENTIAL_DATA_FLAG_MISSING" }` | Đảm bảo payload đăng ký mang đầy đủ thông tin credential public key. |
 | **TC-IOS-REG-06** | iOS App Attest | Chặn signCount ban đầu khác 0 khi đăng ký | Gửi `authData` có `signCount` ban đầu $> 0$ (ví dụ = 1) khi đăng ký | **HTTP 400 Bad Request**<br>`{ "error": "INVALID_SIGN_COUNT" }` | Chuẩn Apple App Attest: Số lần ký của khóa mới đăng ký bắt buộc phải bằng 0. |
-| **TC-IOS-REG-07** | iOS App Attest | Chặn AAGUID không khớp môi trường App Attest | Gửi `authData` có trường AAGUID khác `"appattest"` (hoặc `"appattestdevelop"`) | **HTTP 400 Bad Request**<br>`{ "error": "AAGUID_MISMATCH" }` | Đảm bảo đối tượng xác thực xuất phát từ dịch vụ Apple App Attest chuẩn. |
+| **TC-IOS-REG-07** | iOS App Attest | Chặn AAGUID không khớp môi trường App Attest | Gửi `authData` có trường AAGUID khác `"appattest"` (hoặc `"appattestdevelop"`) | **HTTP 403 Forbidden**<br>`{ "error": "AAGUID_MISMATCH" }` | Đảm bảo đối tượng xác thực xuất phát từ dịch vụ Apple App Attest chuẩn. |
 | **TC-IOS-REG-08** | iOS App Attest | Chặn Root CA Apple không tin cậy | Gửi chuỗi chứng chỉ `x5c` không neo vào Apple App Attest Root CA | **HTTP 403 Forbidden**<br>`{ "error": "UNTRUSTED_ROOT_CA" }` | Bắt buộc neo tin cậy vào chứng chỉ gốc chính thức của Apple. |
 | **TC-IOS-REG-09** | iOS App Attest | Chặn Apple Receipt bị hết hạn hoặc sai lệch App ID | Gửi receipt có thời gian hết hạn trong quá khứ hoặc App ID khác | **HTTP 403 Forbidden**<br>`{ "error": "RECEIPT_EXPIRED" }` hoặc `RECEIPT_APP_ID_MISMATCH` | Thẩm tra biên lai Apple App Attest bảo đảm trạng thái cấp phép khóa còn hiệu lực. |
 | **TC-IOS-REG-10** | iOS App Attest | Chặn định dạng COSE Key không hợp lệ | Cung cấp khóa COSE có kty khác 2 (EC), alg khác -7 (ES256), hoặc crv khác 1 (P-256) | **HTTP 400 Bad Request**<br>`{ "error": "INVALID_COSE_KEY" }` / `INVALID_COSE_ALG` | Ép cấu hình mật mã chuẩn COSE ES256 P-256. |
@@ -1301,12 +1343,15 @@ Ma trận kiểm thử dưới đây bao quát **100% các điều kiện biên,
 | **TC-REQ-AND-08**| Android Business | Chặn thiết bị chưa đăng ký gọi API | Gửi request với `X-Device-Id` ngẫu nhiên chưa qua đăng ký | **HTTP 401 Unauthorized**<br>`{ "error": "DEVICE_NOT_REGISTERED" }` | Nguyên tắc Zero-Trust: Chỉ thiết bị đã chứng minh phần cứng mới được gọi API. |
 | **TC-REQ-IOS-01** | iOS Business | Gửi Request nghiệp vụ hợp lệ với Assertion | Gửi request `POST /api/tarot/read` có header `X-Assertion` hợp lệ, `signCount = 1`, sequence = 1 | **HTTP 200 OK**<br>`status: "SUCCESS"`, backend ghi nhận và tăng `signCount` lên 1 | Xác minh luồng gọi API thông suốt trên nền tảng Apple App Attest. |
 | **TC-REQ-IOS-02** | iOS Business | Chặn thiếu Header `X-Assertion` | Thiết bị iOS gửi request có `X-Device-Id`, `X-Timestamp`, `X-Sequence` nhưng thiếu `X-Assertion` | **HTTP 401 Unauthorized**<br>`{ "error": "MISSING_ASSERTION" }` | Buộc nền tảng iOS phải cung cấp App Attest Assertion làm proof. |
-| **TC-REQ-IOS-03** | iOS Business | Chặn Assertion quá lớn (> 8KB) | Gửi header `X-Assertion` có kích thước Base64 vượt quá 8KB | **HTTP 401 Unauthorized**<br>`{ "error": "ASSERTION_TOO_LARGE" }` | Phòng thủ chống cạn kiệt bộ nhớ và parser amplification. |
-| **TC-REQ-IOS-04** | iOS Business | Chặn cờ AT (Attested Credential) trong Assertion | Gửi assertion có cờ AT (0x40) được bật trong `authenticatorData` | **HTTP 401 Unauthorized**<br>`{ "error": "UNEXPECTED_ATTESTED_CREDENTIAL_DATA" }` | Chuẩn Apple: Cờ AT chỉ được phép xuất hiện lúc đăng ký, cấm trong assertion. |
+| **TC-REQ-IOS-03** | iOS Business | Chặn Assertion quá lớn (> 8KB nhị phân) | Gửi header `X-Assertion` có kích thước Base64 vượt quá 10,924 ký tự (tương đương > 8,192 bytes nhị phân giải mã) | **HTTP 401 Unauthorized**<br>`{ "error": "ASSERTION_TOO_LARGE" }` | Phòng thủ chống cạn kiệt bộ nhớ và parser amplification. |
+| **TC-REQ-IOS-04** | iOS Business | Chặn Assertion chứa dữ liệu Credential trái phép (khi ED tắt) | Gửi assertion có cờ AT (0x40) nhưng cờ ED (0x80) tắt và kèm trailing data (> 37 bytes) | **HTTP 401 Unauthorized**<br>`{ "error": "INVALID_AUTHENTICATOR_DATA_LENGTH" }` | Chuẩn Apple: Cờ AT (0x40) được chấp nhận nếu authData = 37 bytes (ED tắt), từ chối nếu kèm dữ liệu credential. |
 | **TC-REQ-IOS-05** | iOS Business | Chặn Rollback hoặc không tăng `signCount` trên iOS | Request 1 gửi `signCount = 5` thành công; Request 2 gửi tiếp tục `signCount = 5` hoặc `signCount = 4` | **HTTP 401 Unauthorized**<br>`{ "error": "SIGN_COUNT_NOT_INCREASED" }` | Bảo vệ phần cứng Apple: Phát hiện clone khóa hoặc tráo đổi assertion. |
 | **TC-REQ-IOS-06** | iOS Business | Chặn sửa đổi wire body đối với Assertion iOS | Giữ nguyên header `X-Assertion` nhưng sửa đổi 1 byte trong body JSON | **HTTP 401 Unauthorized**<br>`{ "error": "INVALID_SIGNATURE" }` | Composite hash `[authData \|\| SHA256(canonical)]` bị sai lệch chữ ký. |
 | **TC-REQ-IOS-07** | iOS Business | Chặn sai lệch RP ID trong Assertion | Gửi assertion có `rpIdHash` trong authData không khớp với `appId` | **HTTP 401 Unauthorized**<br>`{ "error": "RP_ID_MISMATCH" }` | Đảm bảo assertion được tạo riêng cho ứng dụng hiện tại. |
 | **TC-REQ-IOS-08** | iOS Business | Xác thực tuần tự tăng đồng bộ Sequence & signCount | Gửi 5 request liên tiếp với Sequence tăng dần (1, 2, 3, 4, 5) và signCount tăng dần (1, 2, 3, 4, 5) | **HTTP 200 OK** cho cả 5 request | Xác nhận tính trơn tru của cơ chế đếm kép (Dual Monotonic Counter) trên iOS. |
+| **TC-REQ-IOS-09** | iOS Business | Chặn chữ ký DER ASN.1 bị lỗi định dạng | Gửi `X-Assertion` chứa trường `signature` không đúng cấu trúc DER ASN.1 `(r, s)` | **HTTP 401 Unauthorized**<br>`{ "error": "MALFORMED_DER_SIGNATURE" }` | Đảm bảo định dạng chữ ký ECDSA P-256 DER ASN.1 nghiêm ngặt. |
+| **TC-REQ-IOS-10** | iOS Business | Chặn cờ authenticatorData trái phép (RFU bits) | Gửi assertion có authData mang cờ chứa các bit dự phòng RFU (0x02, 0x08, 0x10, 0x20) | **HTTP 401 Unauthorized**<br>`{ "error": "UNSUPPORTED_AUTHENTICATOR_FLAGS" }` | Ngăn chặn các cờ bất thường vi phạm chuẩn Apple WebAuthn/AppAttest. |
+| **TC-REQ-IOS-11** | iOS Business | Chặn chuỗi Base64 không chuẩn tắc (Non-Canonical Base64) | Gửi `X-Assertion` có padding bị xáo trộn hoặc trailing bits không hợp lệ | **HTTP 401 Unauthorized**<br>`{ "error": "NON_CANONICAL_BASE64_ASSERTION" }` | Chống tấn công Base64 malleability bypass. |
 | **TC-STORE-01** | Resilience/Cache| Chặn Replay trong cửa sổ Redis Quarantine (15s) | Giả lập Redis khởi động lại tại thời điểm $T_0$. Gửi request có timestamp $T < T_0$ trong vòng 15s sau boot | **HTTP 401 Unauthorized**<br>`{ "error": "RETRY_WITH_FRESH_TIMESTAMP" }` | Chống Replay các gói tin bị mất dữ liệu trong Redis do reboot/failover. |
 | **TC-STORE-02** | BigInt Precision| Hỗ trợ an toàn Sequence vượt giới hạn $2^{53}$ | Gửi Sequence = `9007199254740995` ($2^{53} + 3$), sau đó gửi tiếp `9007199254740996` | Cả 2 đều trả về **HTTP 200 OK**; Sequence nhỏ hơn trả về **401 REPLAY_DETECTED** | Chứng minh Redis Lua so sánh chuỗi số học BigInt chính xác, không tràn số IEEE 754. |
 | **TC-STORE-03** | Resilience/Cache| Fail-Closed khi Replay Engine / Redis mất kết nối | Ngắt kết nối Redis trong lúc đang xử lý request | **HTTP 503 Service Unavailable**<br>`{ "error": "STORE_ERROR" }` | Nguyên tắc an ninh: Thà từ chối phục vụ chứ tuyệt đối không cho phép bypass khi mất kiểm soát replay. |

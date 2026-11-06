@@ -15,6 +15,9 @@ import {
 import { Encoder } from 'cbor-x';
 const encoder = new Encoder({ mapsAsObjects: false, useRecords: false, tagUint8Array: false });
 const encode = (val: any) => encoder.encode(val);
+export function encodeCbor(value: unknown): Buffer {
+  return Buffer.from(encoder.encode(value));
+}
 export const APPLE_APP_ATTEST_NONCE_OID = '1.2.840.113635.100.8.2';
 import { AppleReceiptVerifier } from '../../src/platform/ios-receipt.js';
 
@@ -573,6 +576,7 @@ export interface IosAssertionOptions {
   invalidSignatureLength?: boolean;
   malformedDerSignature?: boolean;
   duplicateCborKey?: boolean;
+  extraAuthData?: Buffer;
 }
 
 /**
@@ -589,7 +593,8 @@ export function createIosAssertion(options: IosAssertionOptions): { assertionBas
   const authenticatorData = Buffer.concat([
     rpIdHash,
     Buffer.from([flagsByte]),
-    counterBuf
+    counterBuf,
+    ...(options.extraAuthData ? [options.extraAuthData] : [])
   ]);
 
   const clientDataHash = crypto.createHash('sha256').update(options.canonicalBuffer).digest();

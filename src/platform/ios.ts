@@ -687,14 +687,16 @@ export class IOSSecurityProvider implements DeviceSecurityProvider {
       throw new SecurityError('RP_ID_MISMATCH', 401);
     }
 
-    // Check flags: AT flag (0x40) must NOT be set in assertions.
-    // Reserved flags (0x02, 0x08, 0x10, 0x20) must NOT be set.
-    // Allowed: UP (0x01), UV (0x04), ED (0x80)
+    // Apple App Attest compatibility: DCAppAttestService.generateAssertion on iOS
+    // sets the AT flag (0x40) even though no attested credential data follows.
+    // Apple's assertion verification specification does not mandate checking flags.
+    // We reject unsupported flags (0x3a: RFU bits 1 and 5, WebAuthn L3 BE/BS bits 3 and 4)
+    // and enforce strict payload boundaries:
+    // - If ED (0x80) is clear, authenticatorData MUST be exactly 37 bytes (rejecting any trailing credential data).
+    // - If ED (0x80) is set, exactly one bounded CBOR extension map must follow at byte 37.
+    // Allowed flags: UP (0x01), UV (0x04), AT (0x40), ED (0x80)
     const flags = authenticatorData[32];
-    if ((flags & 0x7a) !== 0) {
-      if ((flags & 0x40) !== 0) {
-        throw new SecurityError('UNEXPECTED_ATTESTED_CREDENTIAL_DATA', 401);
-      }
+    if ((flags & 0x3a) !== 0) {
       throw new SecurityError('UNSUPPORTED_AUTHENTICATOR_FLAGS', 401);
     }
 
