@@ -146,7 +146,7 @@ Lớp `AppAttestFactory` trong `AppAttestClient.swift` tuân thủ nguyên tắc
   - Tự động kích hoạt `RealAppAttestService` gọi trực tiếp `DCAppAttestService.shared`.
   - Khóa riêng được tạo và lưu trữ an toàn trong chip **Secure Enclave** phần cứng.
   - Assertion được Apple App Attest tạo và chứng thực bằng phần cứng.
-  - Nếu thiết bị không hỗ trợ App Attest (`isSupported == false`), client trả lỗi rõ ràng, tuyệt đối **không tự ý hạ policy hay thay bằng mock phần mềm** trên thiết bị thật (tuân thủ `CLIENT_PROTOCOL.md`).
+  - Nếu thiết bị không hỗ trợ App Attest (`isSupported == false`), client trả lỗi rõ ràng, tuyệt đối **không tự ý hạ policy hay thay bằng mock phần mềm** trên thiết bị thật (tuân thủ tài liệu hướng dẫn tích hợp).
 
 ---
 
@@ -164,6 +164,5 @@ Lớp `AppAttestFactory` trong `AppAttestClient.swift` tuân thủ nguyên tắc
 ---
 
 ## 7. Tài liệu tham khảo
-- Đặc tả xác minh từng bit/byte của iOS Assertion: [`docs/IOS_REQUEST_VERIFICATION_SPEC.md`](../../docs/IOS_REQUEST_VERIFICATION_SPEC.md)
+- Đặc tả xác minh từng bit/byte của iOS Assertion: [`docs/SECURITY_SOLUTION.md`](../../docs/SECURITY_SOLUTION.md#5-đặc-tả-xác-minh-nền-tảng-ios-apple-app-attest-specification)
 - Hướng dẫn tích hợp toàn hệ thống: [`docs/CLIENT_INTEGRATION_GUIDE.md`](../../docs/CLIENT_INTEGRATION_GUIDE.md)
-- Đặc tả giao thức Wire Format: [`docs/CLIENT_PROTOCOL.md`](../../docs/CLIENT_PROTOCOL.md)

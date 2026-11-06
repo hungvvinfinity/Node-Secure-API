@@ -8,7 +8,7 @@ import java.security.MessageDigest
 /**
  * OkHttp Interceptor that generates cryptographic attestation headers for protected endpoints.
  *
- * Canonical specification (CLIENT_PROTOCOL.md & src/core/canonical.ts):
+ * Canonical specification (docs/CLIENT_INTEGRATION_GUIDE.md & src/core/canonical.ts):
  *   timestamp:sequence:METHOD:request-target:bodySha256Hex
  *
  * - timestamp: milliseconds as received in header (decimal string)

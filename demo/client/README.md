@@ -1,6 +1,6 @@
 # Node-Secure-API Android Client Demo (Dual-Tier Edition)
 
-Mô-đun demo Android Client hoàn chỉnh cho hệ thống **Node-Secure-API**, tích hợp kiến trúc phân tầng bất đối xứng **Dual-Tier** theo đặc tả `docs/ANDROID_COMPATIBILITY_PLAN.md`:
+Mô-đun demo Android Client hoàn chỉnh cho hệ thống **Node-Secure-API**, tích hợp kiến trúc phân tầng bất đối xứng **Dual-Tier** theo đặc tả `docs/SECURITY_SOLUTION.md`:
 - **Tier 1: Hardware VIP**: TEE / StrongBox Key Attestation, VIP fast-track (0ms delay), lease vĩnh viễn.
 - **Tier 2: Software Protected**: Tương thích 100% thiết bị cũ/unlock bootloader/không có Google Play Services; bảo vệ bằng bài toán Proof of Work (PoW), Rolling Lease 2h, Tarpit Delay 3.0s, và Concurrency Lock (tối đa 1 request in-flight).
 

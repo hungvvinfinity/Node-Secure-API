@@ -6,7 +6,7 @@ import kotlinx.coroutines.sync.withLock
 /**
  * Ensures strict total order for hardware-attested requests at application/coroutine level.
  *
- * As noted in CLIENT_PROTOCOL.md:
+ * As noted in docs/CLIENT_INTEGRATION_GUIDE.md:
  * "Serialize các request được bảo vệ bằng hàng đợi/mutex bao phủ cả send và response để giữ thứ tự;
  *  AtomicLong đơn lẻ không bảo đảm thứ tự đến server."
  *

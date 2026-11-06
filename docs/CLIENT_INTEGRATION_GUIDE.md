@@ -1402,7 +1402,5 @@ chmod +x run_simulation.sh
 
 ## 9. Tham khảo liên kết
 
-- [CLIENT_PROTOCOL.md](CLIENT_PROTOCOL.md) — Đặc tả giao thức Wire Format chi tiết.
-- [ANDROID_COMPATIBILITY_PLAN.md](ANDROID_COMPATIBILITY_PLAN.md) — Kế hoạch tương thích và phòng thủ Dual-Tier.
-- [SCALING_AND_RESILIENCE_PLAN.md](SCALING_AND_RESILIENCE_PLAN.md) — Thiết kế Replay Cache 2 tầng và Timestamp Quarantine.
+- [SECURITY_SOLUTION.md](SECURITY_SOLUTION.md) — Đặc tả Kiến trúc An ninh Toàn diện (Dual-Tier, iOS App Attest, Scaling, Canary & Deployment).
 - [demo/client/README.md](../demo/client/README.md) — Hướng dẫn cài đặt và cấu trúc mã nguồn ứng dụng Demo Android.

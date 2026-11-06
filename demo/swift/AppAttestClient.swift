@@ -198,7 +198,7 @@ public enum AppAttestFactory {
         #if canImport(DeviceCheck)
         // Trên thiết bị thật: LUÔN trả RealAppAttestService.
         // Tuyệt đối không fallback sang MockAppAttestService khi isSupported = false,
-        // tuân thủ CLIENT_PROTOCOL.md mục 42: "không hạ policy attestation".
+        // tuân thủ docs/CLIENT_INTEGRATION_GUIDE.md: "không hạ policy attestation".
         return RealAppAttestService()
         #else
         #if canImport(CryptoKit) || canImport(Crypto)

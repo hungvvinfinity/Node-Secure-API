@@ -275,7 +275,7 @@ describe('iOS Client & Backend Interoperability Test Suite', () => {
   // =========================================================================
   // 2. DETAILED BITFIELD & LENGTH ENFORCEMENT ON authenticatorData[32]
   // =========================================================================
-  describe('2. iOS AuthenticatorData Bitfield & Length Enforcement (docs/IOS_REQUEST_VERIFICATION_SPEC.md)', () => {
+  describe('2. iOS AuthenticatorData Bitfield & Length Enforcement (docs/SECURITY_SOLUTION.md)', () => {
     it('accepts valid flags: 0x00, 0x01 (UP), 0x04 (UV), 0x05 (UP+UV), 0x40 (AT), 0x41 (AT+UP), 0x44 (AT+UV), 0x45 (AT+UP+UV)', async () => {
       const dev = await store.getDevice(registeredDeviceId);
       assert.ok(dev);

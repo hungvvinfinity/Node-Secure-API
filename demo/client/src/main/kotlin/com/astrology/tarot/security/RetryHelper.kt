@@ -19,7 +19,7 @@ class ApiResponseException(
 ) : Exception("HTTP $statusCode: $responseBody")
 
 /**
- * Handles safe request retries adhering to CLIENT_PROTOCOL.md:
+ * Handles safe request retries adhering to docs/CLIENT_INTEGRATION_GUIDE.md:
  *
  * "Không phát lại nguyên gói đã ký. Mỗi retry lấy sequence/timestamp mới, tạo signature mới;
  *  giữ idempotency key trong body đã ký. Nếu server đã commit sequence nhưng response bị mất,

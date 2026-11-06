@@ -5,7 +5,7 @@ import java.security.MessageDigest
 /**
  * Proof of Work (PoW) Solver and Verifier for Tier 2 (Software Protected) devices.
  *
- * Implements the contract specified in docs/ANDROID_COMPATIBILITY_PLAN.md:
+ * Implements the contract specified in docs/SECURITY_SOLUTION.md (Section 4):
  * SHA256(challenge + ":" + salt + ":" + nonce) must have at least `difficulty` leading zero bits.
  */
 object ProofOfWorkSolver {
