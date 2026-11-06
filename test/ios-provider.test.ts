@@ -1557,7 +1557,7 @@ describe('IOSSecurityProvider (Unit & Cryptographic Invariants)', () => {
 
       it('guarantees only 1 winner when 20 concurrent iOS requests fire with the same counter/sequence (RedisStore)', async () => {
         const prefix = `test:sec:ios-race:${crypto.randomUUID()}:`;
-        const store = new RedisSecurityStore({ url: redisUrl, keyPrefix: prefix });
+        const store = new RedisSecurityStore({ url: redisUrl, keyPrefix: prefix, now: () => now });
         const fixture = await createIosAttestationFixture({ appId, now });
         const deviceId = 'ios-race-dev-redis';
 

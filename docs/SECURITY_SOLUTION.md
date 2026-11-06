@@ -56,15 +56,15 @@ flowchart LR
 ### 1.3 Phân Tầng Bảo Vệ & Bảng Đối Thoại Đối Kháng
 
 > [!IMPORTANT]
-> **Ranh giới an ninh giữa 2 tầng:**
-> - **Tier 1 (Hardware VIP):** Loại trừ 100% script PC, máy ảo và app giả mạo nhờ chuỗi chứng chỉ ký từ phần cứng Google/Apple.
-> - **Tier 2 (Software Protected):** Mở cho thiết bị Android không hỗ trợ Key Attestation hoặc máy đã mở khóa bootloader; script PC có thể tham gia nếu chấp nhận chi phí giải PoW nhưng bị kiềm chế chặt chẽ bởi Tarpit Delay 3.0s, Rate Limit 6 RPM và Rolling Lease 2 giờ.
+> **Trạng thái cấu hình hiện tại — Software Tier / Software Encryption ĐANG TẮT:**
+> Cơ chế **Tier 2: Software Protected (Software Key Encryption / PoW)** hiện tại **đang được tắt / vô hiệu hóa** ở môi trường sản phẩm và phía client nhằm tập trung bảo vệ tuyệt đối bằng phần cứng **Tier 1: Hardware VIP** (Android Key Attestation qua TEE / StrongBox và iOS Apple App Attest qua Secure Enclave).
+> Toàn bộ hệ thống hiện hành vận hành ở chế độ **100% Hardware-Enforced** với 0ms delay (Fast-Track) và lease vĩnh viễn. Mọi thiết bị không có chứng thực phần cứng hoặc chỉ hỗ trợ khóa phần mềm đều bị từ chối với HTTP 403 `HARDWARE_TEE_REQUIRED`. Cơ chế Software Tier được lưu giữ trong kiến trúc như một giải pháp phòng vệ dự phòng khi cần tương thích thiết bị cũ.
 
 | Câu hỏi của Kẻ tấn công | Hành vi tấn công dự định | Vì sao Hệ thống chặn đứng được? |
 |---|---|---|
-| **1. "Tôi viết script cURL/Python trên PC để spam hàng triệu request?"** | Giả lập request từ VPS hoặc PC vào endpoint bảo mật. | • **Tier 1:** Bị chặn đứng với `403 UNTRUSTED_ROOT_CA` vì PC không có mộc đỏ Google/Apple Root CA.<br>• **Tier 2:** Bị kiềm chế bởi chi phí CPU giải PoW (~8.3 giờ CPU cho 100k key) kèm Tarpit 3.0s và Rate Limit 6 RPM. |
+| **1. "Tôi viết script cURL/Python trên PC để spam hàng triệu request?"** | Giả lập request từ VPS hoặc PC vào endpoint bảo mật. | • **Tier 1 (Đang kích hoạt):** Bị chặn đứng với `403 UNTRUSTED_ROOT_CA` vì PC không có mộc đỏ Google/Apple Root CA.<br>• **Tier 2 (Hiện đang tắt):** Bị kiềm chế bởi chi phí CPU giải PoW (~8.3 giờ CPU cho 100k key) kèm Tarpit 3.0s và Rate Limit 6 RPM nếu được bật. |
 | **2. "Tôi dùng điện thoại thật, nhưng viết app khác để đúc key nộp lên?"** | Viết app `com.attacker.tool` đúc key phần cứng để bypass mộc Google. | **BỊ BẮT TẠI TRẬN:** Chứng chỉ lá bị ép mang Tag 709. Gateway đọc ra thấy `packageName` không khớp `EXPECTED_PACKAGE_NAME` $\rightarrow$ Ném `403 PACKAGE_NAME_MISMATCH` (hoặc `401 RP_ID_MISMATCH` trên iOS). |
-| **3. "Tôi chạy app trên máy ảo giả lập (Emulator / Nox / LDPlayer)?"** | Tự động hóa qua máy ảo Android trên PC. | **BỊ CHẶN Ở TIER 1:** Giả lập chỉ có cấp độ Software (0). Gateway từ chối với `403 HARDWARE_TEE_REQUIRED`. Nếu chuyển sang Tier 2 thì chịu các hạn chế nghiêm ngặt của Tier 2. |
+| **3. "Tôi chạy app trên máy ảo giả lập (Emulator / Nox / LDPlayer)?"** | Tự động hóa qua máy ảo Android trên PC. | **BỊ CHẶN Ở TIER 1:** Giả lập chỉ có cấp độ Software (0). Gateway từ chối với `403 HARDWARE_TEE_REQUIRED`. Vì Tier 2 hiện đang tắt, máy ảo bị loại trừ 100%. |
 | **4. "Tôi gửi header `X-Test-Mode: mock-ca` để ép server lờ mộc Google?"** | Khai thác cơ chế debug để bypass trust anchor. | **BỊ TRIỆT TIÊU HOÀN TOÀN:** Production entrypoint không chứa bất kỳ cờ client bypass nào; server luôn tuân thủ nguyên tắc Fail-Closed. |
 | **5. "Tôi bắt gói tin hợp lệ trên Wireshark rồi bắn lại (Replay Attack)?"** | Thu thập gói tin đã ký và gửi lại liên tục. | **BỊ TỪ CHỐI TỨC THÌ:**<br>• Gửi lại sau 15 giây: Lỗi `401 EXPIRED_TIMESTAMP`.<br>• Gửi lại ngay lập tức: Lỗi `401 REPLAY_DETECTED` (sequence không tăng) hoặc `401 SIGN_COUNT_NOT_INCREASED` (iOS counter). |
 | **6. "Tôi cắm cáp USB vào máy thật, dùng Frida biến nó thành máy ký hộ (Signing Oracle)?"** | Biến điện thoại thật thành con rối ký request cho script spam PC. | **RÀO CẢN KỸ THUẬT & KINH TẾ:**<br>1. *Độ trễ phần cứng:* Chip TEE ký mất 15–50ms (tối đa ~20–50 req/s/máy).<br>2. *Xung đột Sequence:* Cơ chế sequence đơn luồng khiến các request song song bị xung đột và dính `REPLAY_DETECTED`.<br>3. *Giới hạn thực tế:* Signing oracle vẫn có thể gửi tuần tự trên 1 máy; hệ thống cần kết hợp quota nghiệp vụ và phát hiện bất thường phía backend để hạn chế lạm dụng. |
@@ -197,6 +197,12 @@ $$\text{canonical} = \text{timestamp} \mathbin{\Vert} \text{":"} \mathbin{\Vert}
 ## 4. Kiến Trúc Phân Tầng Bất Đối Xứng (Dual-Tier Architecture)
 
 ### 4.1 Bối cảnh thực tế & Bài toán Zero-Login Friction
+
+> [!NOTE]
+> **Trạng thái cấu hình hiện tại — Software Tier / Software Encryption ĐANG TẮT:**
+> Cơ chế **Tier 2: Software Protected (Software Key Encryption / PoW)** hiện tại **đang được tắt / vô hiệu hóa** ở môi trường sản phẩm và phía client (`ANDROID_ALLOW_SOFTWARE_TIER=false`) nhằm tập trung tuyệt đối vào tiêu chuẩn phần cứng **Tier 1: Hardware VIP** (Android Key Attestation qua TEE / StrongBox và iOS Apple App Attest qua Secure Enclave).
+> Toàn bộ hệ thống hiện hành vận hành ở chế độ **100% Hardware-Enforced** với 0ms delay (Fast-Track) và lease vĩnh viễn. Mọi thiết bị không có chứng thực phần cứng hoặc chỉ hỗ trợ khóa phần mềm đều bị từ chối với HTTP 403 `HARDWARE_TEE_REQUIRED`. Cơ chế Software Tier được lưu giữ trong kiến trúc như một giải pháp phòng vệ dự phòng khi doanh nghiệp chủ động muốn mở rộng hỗ trợ thiết bị cũ/unlock trong tương lai.
+
 Mặc dù chính sách phần cứng (Hardware VIP) cung cấp mức độ bảo mật cao nhất, thực tế thị trường di động cho thấy có khoảng 15% – 30% thiết bị Android của người dùng chân chính không đáp ứng tiêu chuẩn khắt khe này:
 1. Thiết bị đời cũ hoặc giá rẻ chỉ hỗ trợ Keystore mức phần mềm (`attestationSecurityLevel = 0`).
 2. Thiết bị xách tay đã mở khóa bootloader để cài ROM quốc tế (`deviceLocked = false`).
@@ -218,7 +224,7 @@ flowchart TD
 
 ### 4.2 Bảng so sánh chi tiết hai tầng bảo mật
 
-| Tiêu Chí | Tier 1: Hardware VIP | Tier 2: Software Protected |
+| Tiêu Chí | Tier 1: Hardware VIP (Đang Kích Hoạt) | Tier 2: Software Protected (Hiện Đang TẮT) |
 |---|---|---|
 | **Đối tượng thiết bị** | Máy có chip TEE / StrongBox, Google Root CA, bootloader khóa | Máy cũ, chip giá rẻ, unlock bootloader, không GMS |
 | **Xác thực khi đăng ký** | Chuỗi chứng chỉ Google Hardware Attestation | Cặp khóa EC P-256 SPKI PEM + Lời giải Proof of Work (PoW) |
@@ -247,10 +253,10 @@ flowchart TD
 
 ### 4.4 Cấu hình tham số Dual-Tier (`src/config.ts`)
 ```bash
-# Bật/tắt hỗ trợ Software Tier phía Gateway (mặc định: true)
-ANDROID_ALLOW_SOFTWARE_TIER=true
+# Bật/tắt hỗ trợ Software Tier phía Gateway (HIỆN TẠI ĐANG TẮT để ép chuẩn 100% Hardware VIP)
+ANDROID_ALLOW_SOFTWARE_TIER=false
 
-# Độ khó Proof of Work (số bit 0 dẫn đầu, mặc định: 18)
+# Độ khó Proof of Work (chỉ dùng khi Software Tier bật, mặc định: 18 bit)
 POW_DIFFICULTY_BITS=18
 
 # Thời hạn Lease của thiết bị Software (giây, mặc định 2 giờ = 7200)
@@ -556,4 +562,4 @@ Hệ thống **Node-Secure-API** thiết lập một phòng tuyến an ninh khé
 1. **Neo chặt vào phần cứng:** Khóa mật sinh trong TEE / StrongBox / Secure Enclave không thể bị sao chép sang máy tính PC.
 2. **Bảo chứng độc lập:** Xác thực nguồn gốc từ Google Root CA và Apple App Attest Root CA, xóa sổ hoàn toàn botnet và máy ảo giả lập ở phân tầng Hardware VIP.
 3. **Toàn vẹn tuyệt đối:** Chữ ký số trên chuỗi byte thô nguyên bản (`req.rawBody`) và số thứ tự 64-bit đơn điệu trong Redis Lua script chặn đứng tấn công can thiệp dữ liệu và phát lại gói tin.
-4. **Linh hoạt và thực tế:** Người dùng máy thật hưởng trọn trải nghiệm VIP Fast-Track (0ms delay), trong khi các thiết bị không đủ chuẩn phần cứng vẫn được hỗ trợ an toàn qua tầng Software Protected với PoW và Tarpit Delay có kiểm soát.
+4. **Linh hoạt và thực tế:** Toàn bộ hệ thống hiện hành vận hành ở chế độ Hardware VIP (0ms delay, Fast-Track); cơ chế Software Protected được giữ lại trong codebase như giải pháp dự phòng và hiện đang tắt.

@@ -205,7 +205,7 @@ describe('Redis Persistence Across Restart & Server Lifecycle', async () => {
     const receiptRootCA = await createReceiptCA({ now });
 
     function createIosServerInstance() {
-      const store = new RedisSecurityStore({ url: redisUrl, keyPrefix: prefix });
+      const store = new RedisSecurityStore({ url: redisUrl, keyPrefix: prefix, now: () => now });
       const provider = new IOSSecurityProvider({
         trustAnchors: [appleRootCA.certPem],
         appId,
@@ -410,7 +410,7 @@ describe('Redis Persistence Across Restart & Server Lifecycle', async () => {
     };
 
     function createServerInstance() {
-      const store = new RedisSecurityStore({ url: redisUrl, keyPrefix: prefix });
+      const store = new RedisSecurityStore({ url: redisUrl, keyPrefix: prefix, now: () => now });
       const provider = new AndroidSecurityProvider({
         trustAnchors: [rootCA.certPem],
         expectedPackageName: 'com.astrology.tarot',
