@@ -994,6 +994,8 @@ struct RegistrationDTO: Decodable {
 actor AppAttestClient {
     private let service = DCAppAttestService.shared
     private let baseURL: URL
+    private var isWireBusy: Bool = false
+    private var wireWaiters: [CheckedContinuation<Void, Never>] = []
     private var deviceId: String?
     private var keyId: String?
     private var sequence: Int64 = 0
@@ -1001,6 +1003,25 @@ actor AppAttestClient {
 
     init(baseURL: URL) {
         self.baseURL = baseURL
+    }
+
+    private func acquireWireGate() async {
+        if !isWireBusy {
+            isWireBusy = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            wireWaiters.append(continuation)
+        }
+    }
+
+    private func releaseWireGate() {
+        if !wireWaiters.isEmpty {
+            let next = wireWaiters.removeFirst()
+            next.resume()
+        } else {
+            isWireBusy = false
+        }
     }
 
     private func endpointURL(path: String) -> URL {
@@ -1021,6 +1042,9 @@ actor AppAttestClient {
     }
 
     func register() async throws -> String {
+        await acquireWireGate()
+        defer { releaseWireGate() }
+
         guard service.isSupported else { throw NSError(domain: "AppAttest", code: 1, userInfo: [NSLocalizedDescriptionKey: "App Attest not supported"]) }
 
         // 1. Request challenge
@@ -1062,44 +1086,42 @@ actor AppAttestClient {
     }
 
     func executeRequest(path: String, method: String = "POST", body: Data = Data(), idempotencyKey: String = UUID().uuidString) async throws -> (Data, HTTPURLResponse) {
-        guard let dId = deviceId, let kId = keyId else {
+        try Task.checkCancellation()
+        await acquireWireGate()
+        defer { releaseWireGate() }
+        try Task.checkCancellation()
+
+        guard let dId = self.deviceId, let kId = self.keyId else {
             throw NSError(domain: "Auth", code: 401, userInfo: [NSLocalizedDescriptionKey: "Unregistered"])
         }
-        guard sequence < Int64.max else { throw NSError(domain: "Sequence", code: 400) }
+        guard self.sequence < Int64.max else { throw NSError(domain: "Sequence", code: 400) }
 
-        // Snapshot sequence trước suspension point để tránh race condition giữa các request đồng thời
-        sequence += 1
-        let currentSeq = sequence
+        self.sequence += 1
+        let currentSeq = self.sequence
         let seqString = String(currentSeq)
         // Ghi bền vững sequence xuống Keychain trước khi gửi ra wire (xem demo/swift/AppAttestClient.swift)
 
         // Tính timestamp đã được bù lệch đồng hồ (Clock Offset Compensation)
-        let adjustedTimestampMs = Int64(Date().timeIntervalSince1970 * 1000) + clockOffsetMs
+        let adjustedTimestampMs = Int64(Date().timeIntervalSince1970 * 1000) + self.clockOffsetMs
         let timestamp = String(adjustedTimestampMs)
 
         // Chuẩn hóa method
         let normalizedMethod = method.uppercased()
 
         // An toàn khi path có query parameters: dùng URL(string:relativeTo:) thay vì appendingPathComponent
-        guard let fullURL = URL(string: path, relativeTo: baseURL) else {
+        guard let fullURL = URL(string: path, relativeTo: self.baseURL) else {
             throw NSError(domain: "URL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid Path"])
         }
 
-        let target: String
-        if let components = URLComponents(url: fullURL, resolvingAgainstBaseURL: true) {
-            let p = components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath
-            if let q = components.percentEncodedQuery, !q.isEmpty {
-                target = "\(p)?\(q)"
-            } else {
-                target = p
-            }
-        } else {
-            target = path.hasPrefix("/") ? path : "/\(path)"
+        guard let components = URLComponents(url: fullURL, resolvingAgainstBaseURL: true) else {
+            throw NSError(domain: "URL", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL components"])
         }
+        let p = components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath
+        let target = components.percentEncodedQuery.map { "\(p)?\($0)" } ?? p
 
-        let canonical = makeCanonical(timestamp: timestamp, sequence: seqString, method: normalizedMethod, target: target, rawBody: body)
+        let canonical = self.makeCanonical(timestamp: timestamp, sequence: seqString, method: normalizedMethod, target: target, rawBody: body)
         let clientDataHash = Data(SHA256.hash(data: canonical))
-        let assertion = try await service.generateAssertion(kId, clientDataHash: clientDataHash)
+        let assertion = try await self.service.generateAssertion(kId, clientDataHash: clientDataHash)
 
         var request = URLRequest(url: fullURL)
         request.httpMethod = normalizedMethod

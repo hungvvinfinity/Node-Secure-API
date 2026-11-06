@@ -4,6 +4,21 @@ Backend Node.js 24 + TypeScript dựa trên [SECURITY_SOLUTION.md](SECURITY_SOLU
 
 [Kiến trúc & Quyết định bảo mật](SECURITY_SOLUTION.md) · [Giao thức client](docs/CLIENT_PROTOCOL.md) · [Triển khai & Vận hành](docs/DEPLOYMENT.md) · [Kế hoạch tương thích Android (Chưa implement)](docs/ANDROID_COMPATIBILITY_PLAN.md) · [Canary thiết bị thật (Chưa implement)](docs/CANARY.md) · [Nguồn bảo mật & Cập nhật](docs/SECURITY_SOURCES.md)
 
+## Yêu cầu Hệ thống (System Requirements)
+
+- **Node.js 24+** (yêu cầu native ESM và built-in test runner `node:test`).
+- **Swift 6.x trên Linux** (được cài đặt và quản lý thông qua toolchain manager `swiftly`):
+  ```bash
+  # Cài đặt swiftly và phiên bản Swift 6.x mới nhất
+  curl -O https://swift-server.github.io/swiftly/swiftly-install.sh && bash swiftly-install.sh && swiftly install latest
+
+  # Nạp môi trường Swiftly vào phiên làm việc hiện tại
+  source ~/.local/share/swiftly/env.sh
+  ```
+  *Hệ thống hiện tại đã cài đặt sẵn Swift 6.4.2 tại `~/.local/share/swiftly/bin/swift`.*
+- **Docker & Docker Compose** (tùy chọn: dùng để chạy full stack API + Redis an toàn trong container).
+- **macOS với Xcode 15+** (cho môi trường phát triển và kiểm thử native iOS Client trên Simulator / thiết bị thật).
+
 ## Chạy toàn bộ project bằng Docker Compose
 
 `compose.yaml` chạy **API Node.js + Redis**, build image runtime, chờ Redis healthy và kiểm tra readiness API. Dữ liệu Redis ở named volume; API publish tại `http://127.0.0.1:3000`. Không cần Node/Redis cài trên host khi gọi Compose trực tiếp.
@@ -80,7 +95,40 @@ Timestamp lệch tối đa 15 giây. Sequence canonical decimal từ `1` đến 
 
 ## Kiểm thử
 
-Toàn bộ test với Redis thật qua Docker Compose, không cần cài Redis hay dependency trên host:
+### 1. Kiểm thử Backend & iOS Client Interoperability
+
+Bộ test suite được tích hợp toàn diện qua Node.js native test runner (`tsx --test`):
+
+```bash
+# Typecheck toàn bộ mã TypeScript
+npm run typecheck
+
+# Chạy toàn bộ test suites (bao gồm Android, iOS interoperability, HTTP server, Store)
+npm test
+
+# Chạy riêng các test case cho iOS (tự động phát hiện Swift trên máy và kiểm thử cú pháp Swift client)
+npm run test:ios
+
+# Chạy riêng các test case cho Android
+npm run test:android
+```
+
+### 2. Kiểm thử iOS Client trên Linux (Swift 6 qua swiftly)
+
+Khi hệ thống đã cài Swift qua swiftly, integration test trong `npm test` sẽ **tự động phát hiện** toolchain tại `~/.local/share/swiftly/` và thực thi typecheck mã nguồn client. Bạn cũng có thể kiểm tra trực tiếp:
+
+```bash
+# Nạp biến môi trường Swiftly
+source ~/.local/share/swiftly/env.sh
+
+# Kiểm tra phiên bản Swift (yêu cầu Swift 6.x)
+swift --version
+
+# Typecheck / kiểm tra cú pháp mã nguồn iOS Client
+swiftc -typecheck demo/swift/AppAttestClient.swift
+```
+
+### 3. Kiểm thử Toàn bộ với Redis Thật qua Docker Compose
 
 ```bash
 npm run test:docker

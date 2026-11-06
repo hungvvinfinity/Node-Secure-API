@@ -647,8 +647,13 @@ export class IOSSecurityProvider implements DeviceSecurityProvider {
     const decodedAssertion = validateAndDecodeCBOR<Map<string, unknown>>(assertionBuf, {
       maxBytes: 8192,
     });
-    if (!(decodedAssertion instanceof Map)) {
+    if (!(decodedAssertion instanceof Map) || decodedAssertion.size !== 2) {
       throw new SecurityError('INVALID_ASSERTION_FORMAT', 401);
+    }
+    for (const key of decodedAssertion.keys()) {
+      if (key !== 'signature' && key !== 'authenticatorData') {
+        throw new SecurityError('INVALID_ASSERTION_FORMAT', 401);
+      }
     }
 
     const signature = decodedAssertion.get('signature');
